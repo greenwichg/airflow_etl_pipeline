@@ -386,7 +386,7 @@ pie title Monthly Cost: $500
 │              Intermediate Storage               │
 │  ┌───────────────────────────────────────────┐ │
 │  │  AWS S3                                   │ │
-│  │  • Staging area for Snowflake COPY       │ │
+│  │  • Staging area for Snowflake COPY        │ │
 │  │  • CSV format with compression            │ │
 │  └───────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────┘
