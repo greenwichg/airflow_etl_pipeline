@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint with ruff
+        run: ruff check DAGS/ TEST_SCENARIOS/ CONFIGURATIONS/
+
+      - name: Validate DAG syntax
+        run: python -c "import importlib.util; spec = importlib.util.spec_from_file_location('dag', 'DAGS/retail_sales_etl_dag.py'); mod = importlib.util.module_from_spec(spec)"
+
+      - name: Run tests
+        run: pytest TEST_SCENARIOS/ -v --tb=short

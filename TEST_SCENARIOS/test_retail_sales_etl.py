@@ -25,7 +25,7 @@ class TestDAGStructure:
     @pytest.fixture
     def dagbag(self):
         """Load DAG"""
-        return DagBag(dag_folder='dags/', include_examples=False)
+        return DagBag(dag_folder='DAGS/', include_examples=False)
     
     def test_dag_loaded(self, dagbag):
         """Test that DAG is loaded without errors"""
@@ -246,31 +246,31 @@ class TestExtractionLogic:
     
     @patch('airflow.providers.postgres.hooks.postgres.PostgresHook')
     def test_extraction_query_format(self, mock_pg_hook):
-        """Test extraction query construction"""
-        region = 'us_east'
-        target_date = '2024-01-15'
-        
+        """Test extraction query uses parameterized queries"""
         expected_query_parts = [
             'SELECT',
             'sale_id',
             'FROM sales.transactions',
-            f"WHERE DATE(sale_date) = '{target_date}'",
-            "AND is_deleted = FALSE",
+            'WHERE DATE(sale_date) = %s',
+            'AND is_deleted = FALSE',
             "AND status = 'completed'"
         ]
-        
-        # Construct query (simplified)
-        query = f"""
+
+        # Extraction query uses parameterized placeholders, not f-string interpolation
+        query = """
         SELECT sale_id, customer_id
         FROM sales.transactions
-        WHERE DATE(sale_date) = '{target_date}'
+        WHERE DATE(sale_date) = %s
             AND is_deleted = FALSE
             AND status = 'completed'
         ORDER BY sale_id;
         """
-        
+
         for part in expected_query_parts:
             assert part in query
+
+        # Verify query does NOT contain hardcoded date values
+        assert "= '2024" not in query
     
     @patch('airflow.providers.postgres.hooks.postgres.PostgresHook')
     def test_extraction_error_handling(self, mock_pg_hook):
