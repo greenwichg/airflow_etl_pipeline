@@ -1,0 +1,36 @@
+{
+  "regions": [
+    {
+      "name": "us_east",
+      "conn_id": "postgres_us_east",
+      "display_name": "US-EAST",
+      "timezone": "US/Eastern",
+      "extraction_timeout_minutes": 30,
+      "retries": 3
+    },
+    {
+      "name": "us_west",
+      "conn_id": "postgres_us_west",
+      "display_name": "US-WEST",
+      "timezone": "US/Pacific",
+      "extraction_timeout_minutes": 30,
+      "retries": 3
+    },
+    {
+      "name": "europe",
+      "conn_id": "postgres_europe",
+      "display_name": "EUROPE",
+      "timezone": "Europe/London",
+      "extraction_timeout_minutes": 30,
+      "retries": 3
+    },
+    {
+      "name": "asia_pacific",
+      "conn_id": "postgres_asia_pacific",
+      "display_name": "ASIA-PACIFIC",
+      "timezone": "Asia/Tokyo",
+      "extraction_timeout_minutes": 30,
+      "retries": 3
+    }
+  ]
+}
