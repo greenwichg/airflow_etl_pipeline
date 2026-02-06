@@ -11,6 +11,7 @@ Date: 2024
 
 from datetime import datetime, timedelta
 from io import StringIO
+from pathlib import Path
 from typing import Dict, Any
 import csv
 import json
@@ -30,8 +31,17 @@ from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
-# Configuration
-REGIONS = ['us_east', 'us_west', 'europe', 'asia_pacific']
+# Dynamic region configuration — load from JSON at parse time (fast, no DB hit).
+# To add a new region, edit CONFIGURATIONS/region_config.json and add an Airflow connection.
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'CONFIGURATIONS' / 'region_config.json'
+with open(_CONFIG_PATH) as _f:
+    _PIPELINE_CONFIG = json.load(_f)
+
+REGION_CONFIGS = _PIPELINE_CONFIG['regions']
+REGION_NAMES = [r['name'] for r in REGION_CONFIGS]
+REGION_DISPLAY_MAP = {r['name']: r['display_name'] for r in REGION_CONFIGS}
+
+# Table configuration
 EXTRACT_STAGING_TABLE = 'staging.raw_sales_extract'
 EXTRACTION_TABLE = 'staging.raw_sales_data'  # Transformed data staging
 SNOWFLAKE_STAGE_TABLE = 'staging.sales_data_stage'
@@ -56,7 +66,7 @@ logger = logging.getLogger(__name__)
 # PYTHON CALLABLE FUNCTIONS
 # ============================================================================
 
-def extract_sales_data_from_region(region: str, execution_date: str, **context) -> Dict[str, Any]:
+def extract_sales_data_from_region(region: str, conn_id: str, execution_date: str, **context) -> Dict[str, Any]:
     """
     Extract sales data from regional PostgreSQL database for the execution date.
 
@@ -68,13 +78,14 @@ def extract_sales_data_from_region(region: str, execution_date: str, **context) 
 
     Args:
         region: Region identifier (us_east, us_west, etc.)
+        conn_id: Airflow connection ID for the regional database
         execution_date: Airflow execution date
         **context: Airflow context
 
     Returns:
         Dict with extraction metadata (record_count, file_path, etc.)
     """
-    if region not in REGIONS:
+    if region not in REGION_NAMES:
         raise ValueError(f"Invalid region: {region}")
 
     # Parse execution date
@@ -85,7 +96,7 @@ def extract_sales_data_from_region(region: str, execution_date: str, **context) 
     logger.info(f"Extracting sales data for region: {region}, date: {target_date}")
 
     # Step 1: Extract from regional database using parameterized query
-    regional_hook = PostgresHook(postgres_conn_id=f"postgres_{region}")
+    regional_hook = PostgresHook(postgres_conn_id=conn_id)
     regional_conn = regional_hook.get_conn()
     try:
         regional_cursor = regional_conn.cursor()
@@ -197,7 +208,7 @@ def transform_sales_data(execution_date: str, **context) -> Dict[str, Any]:
     ti = context['task_instance']
     extraction_metadata = {}
 
-    for region in REGIONS:
+    for region in REGION_NAMES:
         count = ti.xcom_pull(
             task_ids=f'extract_data.extract_{region}',
             key=f'extraction_count_{region}'
@@ -270,14 +281,8 @@ def transform_sales_data(execution_date: str, **context) -> Dict[str, Any]:
     combined_df['etl_loaded_at'] = datetime.now()
     combined_df['etl_batch_id'] = batch_id
 
-    # 7. Normalize region names
-    region_mapping = {
-        'us_east': 'US-EAST',
-        'us_west': 'US-WEST',
-        'europe': 'EUROPE',
-        'asia_pacific': 'ASIA-PACIFIC'
-    }
-    combined_df['region'] = combined_df['region'].map(region_mapping)
+    # 7. Normalize region names (driven by region_config.json)
+    combined_df['region'] = combined_df['region'].map(REGION_DISPLAY_MAP)
 
     # 8. Data validation
     combined_df = combined_df[combined_df['quantity'] > 0]
@@ -667,22 +672,28 @@ with DAG(
     # ========================================================================
 
     with TaskGroup(group_id='extract_data') as extract_data:
-        for region in REGIONS:
+        for region_cfg in REGION_CONFIGS:
+            region_name = region_cfg['name']
             extract_task = PythonOperator(
-                task_id=f'extract_{region}',
+                task_id=f'extract_{region_name}',
                 python_callable=extract_sales_data_from_region,
                 op_kwargs={
-                    'region': region,
+                    'region': region_name,
+                    'conn_id': region_cfg['conn_id'],
                     'execution_date': '{{ ds }}'
                 },
-                execution_timeout=timedelta(minutes=30),
-                retries=3,
+                execution_timeout=timedelta(
+                    minutes=region_cfg.get('extraction_timeout_minutes', 30)
+                ),
+                retries=region_cfg.get('retries', 3),
                 doc_md=f"""
-                ### Extract Sales Data - {region.upper()}
+                ### Extract Sales Data - {region_cfg['display_name']}
 
-                Extracts yesterday's sales transactions from the {region} regional database.
+                Extracts yesterday's sales transactions from the
+                {region_name} regional database.
 
-                **Connection:** `postgres_{region}`
+                **Connection:** `{region_cfg['conn_id']}`
+                **Timezone:** {region_cfg.get('timezone', 'UTC')}
 
                 **Query Filters:**
                 - Date: Previous day ({{% raw %}}{{{{ yesterday_ds }}}}{{% endraw %}})

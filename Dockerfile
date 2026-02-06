@@ -10,5 +10,12 @@ USER airflow
 COPY requirements.txt /opt/airflow/requirements.txt
 RUN pip install --no-cache-dir -r /opt/airflow/requirements.txt
 
-COPY DAGS/ /opt/airflow/dags/
-COPY CONFIGURATIONS/ /opt/airflow/configurations/
+# Preserve project directory structure so DAG can resolve
+# ../CONFIGURATIONS/region_config.json relative to its own path.
+COPY DAGS/ /opt/airflow/project/DAGS/
+COPY CONFIGURATIONS/ /opt/airflow/project/CONFIGURATIONS/
+
+# Symlink DAGs into Airflow's dags folder
+USER root
+RUN ln -s /opt/airflow/project/DAGS/retail_sales_etl_dag.py /opt/airflow/dags/retail_sales_etl_dag.py
+USER airflow

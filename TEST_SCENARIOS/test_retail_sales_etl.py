@@ -9,6 +9,7 @@ Run with: pytest test_retail_sales_etl.py -v
 
 import pytest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import pandas as pd
 import json
@@ -17,6 +18,13 @@ import json
 from airflow.models import DagBag
 from airflow.utils.state import State
 from airflow.utils.types import DagRunType
+
+# Load the same region config used by the DAG
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'CONFIGURATIONS' / 'region_config.json'
+with open(_CONFIG_PATH) as _f:
+    REGION_CONFIGS = json.load(_f)['regions']
+REGION_NAMES = [r['name'] for r in REGION_CONFIGS]
+REGION_DISPLAY_MAP = {r['name']: r['display_name'] for r in REGION_CONFIGS}
 
 
 class TestDAGStructure:
@@ -84,19 +92,19 @@ class TestDAGStructure:
     def test_task_dependencies(self, dagbag):
         """Test critical task dependencies"""
         dag = dagbag.get_dag(dag_id='retail_sales_etl_pipeline')
-        
+
         # Get specific tasks
         start_task = dag.get_task('start')
         transform_task = dag.get_task('transform_sales_data')
         validate_task = dag.get_task('validate_data_quality')
-        
+
         # Start should have downstream tasks
         assert len(start_task.downstream_task_ids) > 0
-        
-        # Transform should be downstream of extract tasks
-        assert 'extract_data.extract_us_east' in transform_task.upstream_task_ids or \
-               'extract_data.extract_us_west' in transform_task.upstream_task_ids
-        
+
+        # Transform should be downstream of extract tasks (config-driven)
+        extract_task_ids = {f'extract_data.extract_{r}' for r in REGION_NAMES}
+        assert extract_task_ids & transform_task.upstream_task_ids
+
         # Validate should be downstream of transform
         assert 'transform_sales_data' in validate_task.upstream_task_ids
 
@@ -177,17 +185,10 @@ class TestDataTransformation:
         assert all(sample_data['sale_day'] == 15)
     
     def test_region_normalization(self, sample_data):
-        """Test region code standardization"""
-        region_mapping = {
-            'us_east': 'US-EAST',
-            'us_west': 'US-WEST',
-            'europe': 'EUROPE',
-            'asia_pacific': 'ASIA-PACIFIC'
-        }
-        
-        sample_data['region'] = sample_data['region'].map(region_mapping)
-        
-        expected_regions = {'US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC'}
+        """Test region code standardization uses config-driven mapping"""
+        sample_data['region'] = sample_data['region'].map(REGION_DISPLAY_MAP)
+
+        expected_regions = set(REGION_DISPLAY_MAP.values())
         assert set(sample_data['region'].unique()) == expected_regions
 
 
@@ -239,6 +240,42 @@ class TestDataQuality:
             )
             
             assert is_valid == case['valid'], f"Failed for case: {case}"
+
+
+class TestRegionConfig:
+    """Test dynamic region configuration"""
+
+    def test_config_file_exists(self):
+        """Test that region config file exists and is valid JSON"""
+        assert _CONFIG_PATH.exists(), f"Config not found: {_CONFIG_PATH}"
+        with open(_CONFIG_PATH) as f:
+            config = json.load(f)
+        assert 'regions' in config
+        assert len(config['regions']) > 0
+
+    def test_region_config_required_fields(self):
+        """Each region must have required fields"""
+        required_fields = {'name', 'conn_id', 'display_name'}
+        for region_cfg in REGION_CONFIGS:
+            missing = required_fields - set(region_cfg.keys())
+            assert not missing, f"Region {region_cfg.get('name', '?')} missing fields: {missing}"
+
+    def test_region_names_are_unique(self):
+        """Region names must be unique"""
+        assert len(REGION_NAMES) == len(set(REGION_NAMES))
+
+    def test_display_names_are_unique(self):
+        """Display names must be unique"""
+        display_names = [r['display_name'] for r in REGION_CONFIGS]
+        assert len(display_names) == len(set(display_names))
+
+    def test_dag_generates_extract_tasks_from_config(self):
+        """DAG should create one extract task per config entry"""
+        dagbag = DagBag(dag_folder='DAGS/', include_examples=False)
+        dag = dagbag.get_dag(dag_id='retail_sales_etl_pipeline')
+        for region_cfg in REGION_CONFIGS:
+            task_id = f'extract_data.extract_{region_cfg["name"]}'
+            assert dag.has_task(task_id), f"Missing task: {task_id}"
 
 
 class TestExtractionLogic:
@@ -415,16 +452,14 @@ class TestPerformance:
     
     def test_parallel_extraction_benefit(self):
         """Verify parallel execution reduces total time"""
-        # Sequential: 4 regions * 10 minutes = 40 minutes
-        sequential_time = 4 * 10
-        
-        # Parallel: max(10, 10, 10, 10) = 10 minutes
-        parallel_time = max(10, 10, 10, 10)
-        
-        time_saved = sequential_time - parallel_time
-        
-        assert time_saved == 30  # 30 minutes saved
+        num_regions = len(REGION_NAMES)
+        time_per_region = 10  # minutes
+
+        sequential_time = num_regions * time_per_region
+        parallel_time = time_per_region  # all run concurrently
+
         assert parallel_time < sequential_time
+        assert sequential_time - parallel_time == (num_regions - 1) * time_per_region
 
 
 # ============================================================================
