@@ -1,343 +1,427 @@
-# Retail Sales ETL Pipeline - Apache Airflow
+# Retail Sales ETL Pipeline
 
-## Overview
+**Production-grade Apache Airflow pipeline** that extracts sales data from multiple regional PostgreSQL databases, transforms it into a unified schema, validates data quality, and loads it into Snowflake for enterprise analytics.
 
-Production-grade Apache Airflow DAG for automating the daily extraction, transformation, and loading (ETL) of sales data from multiple regional PostgreSQL databases into a centralized Snowflake data warehouse.
+| | |
+|---|---|
+| **Schedule** | Daily at 06:00 UTC |
+| **SLA** | 2 hours |
+| **Throughput** | ~2M records/day across 4 regions |
+| **Runtime** | ~40 minutes |
+| **Orchestrator** | Apache Airflow 2.5+ |
+| **Warehouse** | Snowflake |
 
-### Business Context
+---
 
-**Challenge:** A retail company operates across multiple regions (US East, US West, Europe, Asia Pacific) with independent PostgreSQL databases. Business analysts need consolidated, consistent sales data for enterprise-wide reporting and analytics.
+## Table of Contents
 
-**Solution:** Automated daily ETL pipeline that:
-- Extracts sales transactions from 4 regional databases in parallel
-- Transforms and standardizes data to a unified schema
-- Validates data quality before loading
-- Loads into Snowflake with upsert logic
-- Provides monitoring and alerting
-
-**Impact:** 
-- Reduced manual data consolidation from 4+ hours to automated 30-minute process
-- Eliminated manual errors in data aggregation
-- Enabled real-time business intelligence dashboards
-- Improved reporting accuracy and timeliness
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Tech Stack](#tech-stack)
+- [DAG Flow](#dag-flow)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Data Quality](#data-quality)
+- [Testing](#testing)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [Future Enhancements](#future-enhancements)
 
 ---
 
 ## Architecture
 
+### High-Level Data Flow
+
+```mermaid
+graph LR
+    subgraph Sources["Regional Databases"]
+        PG1[(US East<br/>PostgreSQL)]
+        PG2[(US West<br/>PostgreSQL)]
+        PG3[(Europe<br/>PostgreSQL)]
+        PG4[(APAC<br/>PostgreSQL)]
+    end
+
+    subgraph Airflow["Airflow Orchestration"]
+        EXT["Parallel<br/>Extraction"]
+        TRN["Transform<br/>& Unify"]
+        VAL{"Data Quality<br/>Validation"}
+    end
+
+    subgraph Staging
+        STG[(PostgreSQL<br/>Staging)]
+        S3[(S3<br/>Bucket)]
+    end
+
+    subgraph Warehouse["Snowflake"]
+        SF_STG[Stage Table]
+        SF_FINAL[(analytics.sales_fact)]
+    end
+
+    PG1 & PG2 & PG3 & PG4 --> EXT
+    EXT --> STG --> TRN --> VAL
+    VAL -->|Pass| S3 --> SF_STG -->|MERGE| SF_FINAL
+    VAL -->|Fail| ALERT[Alert & Skip]
+
+    style VAL fill:#ffeb3b
+    style ALERT fill:#f44336,color:#fff
+    style SF_FINAL fill:#4caf50,color:#fff
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        AIRFLOW ORCHESTRATION                    │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                ┌───────────────┴───────────────┐
-                │                               │
-        ┌───────▼───────┐              ┌───────▼───────┐
-        │  EXTRACTION   │              │  EXTRACTION   │
-        │   (Parallel)  │              │   (Parallel)  │
-        └───────┬───────┘              └───────┬───────┘
-                │                               │
-    ┌───────────┼───────────┬──────────────────┘
-    │           │           │           │
-┌───▼───┐  ┌───▼───┐  ┌───▼───┐  ┌───▼───┐
-│US-East│  │US-West│  │ Europe│  │  APAC │
-│ PostDB│  │ PostDB│  │ PostDB│  │ PostDB│
-└───┬───┘  └───┬───┘  └───┬───┘  └───┬───┘
-    │           │           │           │
-    └───────────┼───────────┴───────────┘
-                │
-        ┌───────▼────────┐
-        │ TRANSFORMATION │
-        │   (Python)     │
-        └───────┬────────┘
-                │
-        ┌───────▼────────┐
-        │ DATA QUALITY   │
-        │   VALIDATION   │
-        └───────┬────────┘
-                │
-           ┌────┴─────┐
-           │          │
-    ┌──────▼──┐  ┌───▼────────┐
-    │  PASS   │  │    FAIL    │
-    │         │  │  (Alert)   │
-    └────┬────┘  └────────────┘
-         │
-    ┌────▼─────┐
-    │   S3     │
-    │ Staging  │
-    └────┬─────┘
-         │
-    ┌────▼─────────┐
-    │  SNOWFLAKE   │
-    │   STAGING    │
-    └────┬─────────┘
-         │
-    ┌────▼─────────┐
-    │  SNOWFLAKE   │
-    │   MERGE      │
-    └────┬─────────┘
-         │
-    ┌────▼─────────┐
-    │ ANALYTICS DB │
-    │ (Final Table)│
-    └──────────────┘
+
+### End-to-End Pipeline
+
+```
+ Regional DBs          Airflow                 Staging              Snowflake
+ ============     ================        ===============      ===============
+
+ +-----------+    +--------------+
+ | US East   |--->| extract_     |
+ | PostgreSQL|    | us_east      |---+
+ +-----------+    +--------------+   |
+                                     |   +-------------+    +-----------+    +----------+
+ +-----------+    +--------------+   +-->| PostgreSQL  |--->|    S3     |--->| Staging  |
+ | US West   |--->| extract_     |---+   | staging     |    | (CSV)    |    | table    |
+ | PostgreSQL|    | us_west      |       +------+------+    +----------+    +----+-----+
+ +-----------+    +--------------+              |                                |
+                                          +-----v------+                   +-----v-----+
+ +-----------+    +--------------+        | Transform  |                   |   MERGE   |
+ | Europe    |--->| extract_     |---+    | & validate |                   | (upsert)  |
+ | PostgreSQL|    | europe       |   |    +------------+                   +-----+-----+
+ +-----------+    +--------------+   |                                           |
+                                     |                                     +-----v-----+
+ +-----------+    +--------------+   |                                     | analytics |
+ | APAC      |--->| extract_     |---+                                     | .sales_   |
+ | PostgreSQL|    | asia_pacific |                                         | fact      |
+ +-----------+    +--------------+                                         +-----------+
+```
+
+---
+
+## Project Structure
+
+```
+airflow_etl_pipeline/
+|
+|-- dags/
+|   +-- retail_sales_etl_dag.py        # Main DAG: extraction, transform, validate, load
+|
+|-- config/
+|   |-- region_config.json             # Dynamic region definitions (add regions here)
+|   +-- airflow_config_setup.py        # Connection & variable setup helpers
+|
+|-- tests/
+|   +-- test_retail_sales_etl.py       # Unit tests: DAG structure, transforms, quality
+|
+|-- docs/
+|   |-- architecture_diagrams.md       # Mermaid architecture diagrams
+|   +-- interview_prep.md              # Interview Q&A guide
+|
+|-- envs/
+|   +-- env.template                   # Environment variable template
+|
+|-- .github/workflows/
+|   +-- ci.yml                         # CI: lint, DAG validation, tests
+|
+|-- Dockerfile                         # Airflow image with project deps
+|-- docker-compose.yml                 # Local dev stack (Airflow + PostgreSQL)
+|-- requirements.txt                   # Pinned Python dependencies
+|-- .gitignore
++-- README.md
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Orchestration** | Apache Airflow 2.5+ | DAG scheduling, task management, retries |
+| **Source DBs** | PostgreSQL 12+ | 4 regional transactional databases |
+| **Staging DB** | PostgreSQL 12+ | Intermediate transformation storage |
+| **Processing** | Python / Pandas | Data consolidation, cleaning, enrichment |
+| **Object Storage** | AWS S3 | Staging area for Snowflake COPY |
+| **Data Warehouse** | Snowflake | Final analytics tables with clustering |
+| **Bulk Insert** | SQLAlchemy | Parameterized batch writes to PostgreSQL |
+| **Testing** | pytest | Unit, config, and integration tests |
+| **CI/CD** | GitHub Actions | Lint (ruff), DAG validation, test suite |
+| **Containers** | Docker / Compose | Reproducible local development |
+
+---
+
+## DAG Flow
+
+```mermaid
+graph TD
+    START(["start"]) --> TG
+
+    subgraph TG["extract_data (TaskGroup -- parallel)"]
+        E1["extract_us_east"]
+        E2["extract_us_west"]
+        E3["extract_europe"]
+        E4["extract_asia_pacific"]
+    end
+
+    TG --> TRANSFORM["transform_sales_data"]
+    TRANSFORM --> VALIDATE{"validate_data_quality"}
+
+    VALIDATE -->|Pass| LOAD["load_to_snowflake"]
+    VALIDATE -->|Fail| FAIL["data_quality_failure"]
+
+    LOAD --> STAGE["stage_data_in_snowflake"]
+    STAGE --> MERGE["merge_to_final_table"]
+    MERGE --> VERIFY["verify_snowflake_load"]
+    VERIFY --> SUCCESS(["pipeline_success"])
+
+    SUCCESS --> END(["end"])
+    FAIL --> END
+
+    style TG fill:#e3f2fd
+    style VALIDATE fill:#ffeb3b
+    style SUCCESS fill:#4caf50,color:#fff
+    style FAIL fill:#f44336,color:#fff
+```
+
+**Key settings:**
+
+```python
+schedule_interval = '0 6 * * *'   # Daily at 06:00 UTC
+max_active_runs   = 1             # Sequential execution only
+retries           = 2             # With exponential backoff (5 / 10 / 20 min)
+sla               = 2 hours      # Alert if exceeded
 ```
 
 ---
 
 ## Features
 
-### 1. **Parallel Data Extraction**
-- Concurrent extraction from 4 regional databases
-- Region-specific connection pooling
-- Automatic retry with exponential backoff
-- Extraction metadata tracking
+### Parallel Extraction
+Four regional databases are extracted concurrently inside an Airflow TaskGroup, cutting extraction time from ~40 min (sequential) to ~10 min.
 
-### 2. **Comprehensive Data Transformation**
-- Deduplication based on business keys
-- Data type standardization
-- Derived metrics calculation (net_amount, gross_profit)
-- Partition column generation for query optimization
-- Region code normalization
-- Business rule validation
+### Config-Driven Dynamic DAG
+Regions are defined in `config/region_config.json`. Adding a new region requires **zero code changes** -- just add a JSON entry and an Airflow connection:
 
-### 3. **Data Quality Validation**
-- Minimum record count thresholds
-- NULL value percentage checks (< 5%)
-- Business logic validation (quantity > 0, prices positive)
-- Sanity checks on calculated fields
-- Automated failure notifications
+```json
+{
+  "name": "latin_america",
+  "conn_id": "postgres_latin_america",
+  "display_name": "LATAM",
+  "timezone": "America/Sao_Paulo",
+  "extraction_timeout_minutes": 30,
+  "retries": 3
+}
+```
 
-### 4. **Idempotent Loads**
-- Upsert logic (MERGE statements)
-- Batch ID tracking for reprocessing
-- No duplicate records in target
-- Support for late-arriving data
+### Comprehensive Transformations
+| Step | Description |
+|------|------------|
+| Deduplication | Remove duplicate `sale_id` records |
+| Type standardization | Cast dates, decimals consistently |
+| Null handling | Fill missing `discount_amount` / `tax_amount` with 0 |
+| Derived columns | `net_amount`, `gross_profit` |
+| Partition columns | `sale_year`, `sale_month`, `sale_day` for Snowflake |
+| Region normalization | `us_east` -> `US-EAST` (config-driven) |
+| Business rules | Filter `quantity > 0`, `unit_price > 0`, `total_amount > 0` |
 
-### 5. **Monitoring & Observability**
-- XCom for inter-task communication
-- Comprehensive logging at each stage
-- SLA monitoring (2-hour completion target)
-- Email alerts on failures
-- CloudWatch/Datadog integration ready
+### Idempotent Loads
+- MERGE (upsert) into `analytics.sales_fact` -- safe for reruns
+- Batch ID (`etl_batch_id`) tracks each execution date
+- DELETE + INSERT staging pattern ensures clean intermediate state
 
-### 6. **Error Handling**
-- Task-level retries with exponential backoff
-- Graceful degradation (branch on validation failure)
-- Detailed error diagnostics
-- Automatic rollback capabilities
+### Parameterized SQL
+All runtime values (`target_date`, `batch_id`, `region`) use `%s` placeholders via `cursor.execute(query, params)` -- no f-string interpolation in SQL.
+
+### Fail-Fast Validation
+`BranchPythonOperator` gates the Snowflake load behind multi-layer quality checks. On failure, the pipeline skips loading and sends alerts.
 
 ---
 
-## Prerequisites
+## Quick Start
 
-### Software Requirements
-```
-Python 3.8+
-Apache Airflow 2.5+
-PostgreSQL 12+
-Snowflake Account
-AWS S3 (for staging)
-```
-
-### Python Packages
-```
-apache-airflow[postgres,snowflake,amazon]>=2.5.0
-apache-airflow-providers-postgres>=5.0.0
-apache-airflow-providers-snowflake>=4.0.0
-apache-airflow-providers-amazon>=8.0.0
-pandas>=1.5.0
-boto3>=1.26.0
-sqlalchemy>=1.4.0
-psycopg2-binary>=2.9.0
-snowflake-connector-python>=3.0.0
-```
-
-### Infrastructure Requirements
-- Airflow cluster (minimum 4 workers for parallel extraction)
-- Network connectivity to regional PostgreSQL databases
-- S3 bucket for data staging
-- Snowflake warehouse (MEDIUM size recommended)
-
----
-
-## Installation & Setup
-
-### 1. Install Dependencies
+### Option A: Docker (recommended)
 
 ```bash
-# Install Airflow with required providers
-pip install apache-airflow[postgres,snowflake,amazon]==2.5.0
+git clone <repo-url> && cd airflow_etl_pipeline
+
+# Start Airflow + PostgreSQL
+docker compose up -d
+
+# Open Airflow UI
+open http://localhost:8080    # admin / admin
+```
+
+### Option B: Local
+
+```bash
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Initialize Airflow database
+# 2. Initialize Airflow
 airflow db init
-```
 
-### 2. Configure Airflow Connections
-
-```bash
-# Source environment variables
+# 3. Configure connections & variables
+cp envs/env.template .env
 source .env
-
-# Run setup script
 python config/airflow_config_setup.py
 
-# Or manually via CLI (see config/airflow_config_setup.py for commands)
-```
-
-### 3. Set Up Airflow Variables
-
-Via Airflow UI: **Admin → Variables**
-
-| Variable | Value | Description |
-|----------|-------|-------------|
-| `ALERT_EMAIL_LIST` | `team@company.com` | Comma-separated email list |
-| `S3_STAGING_BUCKET` | `data-pipeline-staging` | S3 bucket for staging |
-| `SNOWFLAKE_WAREHOUSE` | `ETL_WH` | Snowflake compute warehouse |
-| `MIN_RECORD_COUNT` | `100` | Minimum expected records |
-| `MAX_NULL_PERCENTAGE` | `5.0` | Max allowed NULL % |
-
-### 4. Deploy DAG
-
-```bash
-# Copy DAG to Airflow DAGs folder
+# 4. Deploy DAG
 cp dags/retail_sales_etl_dag.py $AIRFLOW_HOME/dags/
 
-# Validate DAG
+# 5. Validate & start
 airflow dags list
 airflow dags test retail_sales_etl_pipeline 2024-01-15
-
-# Unpause DAG
 airflow dags unpause retail_sales_etl_pipeline
 ```
 
-### 5. Set Up Snowflake
+---
 
-```sql
--- Execute setup SQL (see config/airflow_config_setup.py)
--- Creates warehouse, database, schema, tables, and roles
+## Configuration
+
+### Airflow Connections
+
+| Connection ID | Type | Host | Purpose |
+|--------------|------|------|---------|
+| `postgres_us_east` | Postgres | us-east-db.company.com | US East regional DB |
+| `postgres_us_west` | Postgres | us-west-db.company.com | US West regional DB |
+| `postgres_europe` | Postgres | eu-db.company.com | Europe regional DB |
+| `postgres_asia_pacific` | Postgres | apac-db.company.com | APAC regional DB |
+| `postgres_default` | Postgres | staging-db.company.com | Staging DB |
+| `snowflake_default` | Snowflake | -- | Data warehouse |
+| `aws_default` | AWS | -- | S3 access |
+
+### Airflow Variables
+
+Set via **Admin -> Variables** in the Airflow UI:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_STAGING_BUCKET` | `data-pipeline-staging` | S3 bucket for CSV staging |
+| `ALERT_EMAIL_LIST` | `data-eng@company.com` | Failure notification recipients |
+| `SNOWFLAKE_WAREHOUSE` | `ETL_WH` | Snowflake compute warehouse |
+
+### Region Config (`config/region_config.json`)
+
+Each entry generates an extraction task dynamically:
+
+```json
+{
+  "regions": [
+    {
+      "name": "us_east",
+      "conn_id": "postgres_us_east",
+      "display_name": "US-EAST",
+      "timezone": "US/Eastern",
+      "extraction_timeout_minutes": 30,
+      "retries": 3
+    }
+  ]
+}
 ```
 
 ---
 
-## DAG Structure
+## Data Quality
 
-### Task Groups
+### Validation Gates
 
-#### 1. **Extraction Phase** (`extract_data`)
-Parallel extraction from regional databases:
-```python
-extract_us_east → 
-extract_us_west → transform_sales_data
-extract_europe → 
-extract_asia_pacific → 
-```
+Quality checks run **before** any data reaches Snowflake:
 
-#### 2. **Transformation Phase** (`transform_sales_data`)
-Single task that:
-- Consolidates all regional data
-- Applies transformations
-- Stores in PostgreSQL staging
+| Check | Threshold | On Failure |
+|-------|-----------|------------|
+| Minimum record count | >= 100 | Pipeline branches to failure path |
+| NULL % in critical columns | < 5% | Pipeline branches to failure path |
+| Quantity validation | > 0 | Filtered during transformation |
+| Price validation | > 0 | Filtered during transformation |
+| Amount sanity | 0.5x -- 2x of `qty * price` | Filtered during transformation |
 
-#### 3. **Validation Phase** (`validate_data_quality`)
-Branch operator that routes to:
-- **Success Path**: `load_to_snowflake` → ...
-- **Failure Path**: `data_quality_failure` → alert
+### Validation Flow
 
-#### 4. **Load Phase** (Snowflake)
-```
-prepare_load → stage_data → merge_to_final → verify_load
-```
+```mermaid
+graph TD
+    A([Transformed Data]) --> B{Records >= 100?}
+    B -->|No| F["Fail: below threshold"]
+    B -->|Yes| C{NULL % <= 5%?}
+    C -->|No| F
+    C -->|Yes| D{Business rules valid?}
+    D -->|No| F
+    D -->|Yes| E["Pass: proceed to load"]
 
-### Key Configuration
+    F --> ALERT["Alert + skip load"]
 
-```python
-# Schedule: Daily at 6 AM UTC
-schedule_interval='0 6 * * *'
-
-# SLA: Complete within 2 hours
-sla=timedelta(hours=2)
-
-# Retries: 2 retries with exponential backoff
-retries=2
-retry_delay=timedelta(minutes=5)
-
-# Concurrency: Single DAG run at a time
-max_active_runs=1
+    style E fill:#4caf50,color:#fff
+    style F fill:#f44336,color:#fff
+    style ALERT fill:#ff9800,color:#fff
 ```
 
 ---
 
-## Monitoring & Operations
+## Testing
 
-### Metrics to Monitor
+```bash
+# Run full test suite
+pytest tests/ -v
 
-1. **Pipeline Health**
-   - DAG run success rate
-   - Task failure patterns
-   - SLA breaches
-
-2. **Data Quality**
-   - Record counts per region
-   - NULL value percentages
-   - Validation failure reasons
-
-3. **Performance**
-   - Extraction duration per region
-   - Transformation processing time
-   - Snowflake load time
-
-### Alerting
-
-**Email Alerts Triggered On:**
-- Task failures (after retries exhausted)
-- Data quality validation failures
-- SLA breaches (> 2 hours)
-- Unexpected data anomalies
-
-**Alert Contents:**
-- Failed task details
-- Error messages and stack traces
-- Execution date and batch ID
-- Diagnostic information
-
-### Logging
-
-```python
-# View logs via Airflow UI
-# Or query directly
-airflow tasks logs retail_sales_etl_pipeline extract_us_east 2024-01-15
-
-# CloudWatch integration (if enabled)
-# Logs automatically shipped to CloudWatch Logs
+# Run specific test class
+pytest tests/test_retail_sales_etl.py::TestRegionConfig -v
+pytest tests/test_retail_sales_etl.py::TestDataTransformation -v
 ```
+
+### Test Coverage
+
+| Class | Tests | What it covers |
+|-------|-------|---------------|
+| `TestDAGStructure` | 5 | DAG loads, schedule, args, task count, dependencies |
+| `TestRegionConfig` | 5 | Config file validity, required fields, uniqueness, task generation |
+| `TestDataTransformation` | 5 | Deduplication, null handling, derived columns, partitions, regions |
+| `TestDataQuality` | 3 | Record thresholds, null %, business rule validation |
+| `TestExtractionLogic` | 2 | Parameterized query format, error handling |
+| `TestSnowflakeOperations` | 2 | MERGE structure, upsert logic |
+| `TestMonitoringAndLogging` | 2 | XCom metadata, transformation metadata |
+| `TestErrorScenarios` | 2 | Zero records, partial region failure |
+| `TestPerformance` | 1 | Parallel vs sequential extraction benefit |
+
+### CI Pipeline (`.github/workflows/ci.yml`)
+
+Runs on every push/PR to `main`:
+1. **Lint** -- `ruff check dags/ tests/ config/`
+2. **DAG syntax** -- Validates DAG parses without errors
+3. **Tests** -- `pytest tests/ -v`
 
 ---
 
-## Data Quality Rules
+## Performance
 
-### Validation Checks
+| Phase | Duration | Details |
+|-------|----------|---------|
+| Extraction (parallel) | ~10 min | 4 regions at ~2.5 min each |
+| Transformation | ~15 min | Pandas + SQLAlchemy bulk insert |
+| Validation | ~5 min | SQL-based quality checks |
+| Snowflake Load | ~10 min | S3 COPY + MERGE upsert |
+| **Total** | **~40 min** | **Well under 2-hour SLA** |
 
-| Check | Threshold | Action on Failure |
-|-------|-----------|-------------------|
-| Min Record Count | 100 records | Fail pipeline, send alert |
-| NULL Percentage | < 5% per column | Fail pipeline, send alert |
-| Quantity | > 0 | Filter out invalid records |
-| Unit Price | > 0 | Filter out invalid records |
-| Total Amount | > 0 | Filter out invalid records |
-| Amount Sanity | 0.5x to 2x qty*price | Filter out invalid records |
+### Scaling Strategy
 
-### Data Transformations
+```mermaid
+graph LR
+    subgraph Current["Current (2M/day)"]
+        A1["4 regions / Pandas"]
+    end
+    subgraph Scaled["10x Scale (20M/day)"]
+        B1["N regions / PySpark on EMR"]
+    end
+    A1 -.->|"Add regions via JSON<br/>Swap Pandas for Spark"| B1
 
-1. **Deduplication**: Remove duplicate `sale_id`
-2. **Type Casting**: Standardize dates, decimals
-3. **Derived Columns**: 
-   - `net_amount = total_amount - discount_amount`
-   - `gross_profit = net_amount - tax_amount`
-4. **Partitioning**: Add `sale_year`, `sale_month`, `sale_day`
-5. **Normalization**: Standardize region codes
+    style Current fill:#e3f2fd
+    style Scaled fill:#c8e6c9
+```
+
+| Component | Current | At 10x |
+|-----------|---------|--------|
+| Extraction | 4 parallel regions | N parallel (config-driven) |
+| Transform | Pandas (single node) | PySpark on EMR/Databricks |
+| S3 staging | Single file | Partitioned files |
+| Snowflake | MEDIUM warehouse | LARGE + auto-scaling |
 
 ---
 
@@ -345,247 +429,72 @@ airflow tasks logs retail_sales_etl_pipeline extract_us_east 2024-01-15
 
 ### Common Issues
 
-#### 1. Connection Timeout to Regional Database
+**Connection timeout to regional DB**
 ```
 Error: "could not connect to server: Connection timed out"
 ```
-**Solution:**
-- Verify network connectivity
-- Check security group / firewall rules
-- Increase `connect_timeout` in connection config
+Check network/firewall rules. Increase `connect_timeout` in the Airflow connection.
 
-#### 2. Data Quality Validation Failure
+**Data quality validation failure**
 ```
 Error: "Record count 45 is below threshold 100"
 ```
-**Solution:**
-- Investigate source database for missing data
-- Check if date filter is correct
-- Verify business hours / regional holidays
+Investigate source DB for missing data. Check regional holidays or date filter issues.
 
-#### 3. Snowflake Load Timeout
+**Snowflake load timeout**
 ```
 Error: "SQL execution timeout"
 ```
-**Solution:**
-- Scale up Snowflake warehouse size
-- Check for table locks
-- Optimize MERGE statement
+Scale up the Snowflake warehouse. Check for table locks.
 
-#### 4. S3 Permission Denied
-```
-Error: "Access Denied when writing to S3"
-```
-**Solution:**
-- Verify IAM role / credentials
-- Check S3 bucket policy
-- Ensure bucket exists and is accessible
+### Recovery
 
-### Recovery Procedures
-
-#### Manual Rerun
 ```bash
-# Rerun specific date
-airflow dags backfill retail_sales_etl_pipeline \\
-    --start-date 2024-01-15 \\
-    --end-date 2024-01-15
+# Rerun a specific date
+airflow dags backfill retail_sales_etl_pipeline \
+    --start-date 2024-01-15 --end-date 2024-01-15
 
-# Clear failed task and rerun
-airflow tasks clear retail_sales_etl_pipeline \\
-    --task-regex '.*' \\
-    --start-date 2024-01-15 \\
-    --end-date 2024-01-15
+# Clear failed tasks and retry
+airflow tasks clear retail_sales_etl_pipeline \
+    --task-regex '.*' \
+    --start-date 2024-01-15 --end-date 2024-01-15
 ```
 
-#### Data Rollback
 ```sql
--- Snowflake: Delete specific batch
-DELETE FROM analytics.sales_fact
-WHERE etl_batch_id = '20240115';
-
--- Rerun DAG for that date
+-- Rollback a batch in Snowflake, then rerun
+DELETE FROM analytics.sales_fact WHERE etl_batch_id = '20240115';
 ```
 
 ---
 
-## Performance Optimization
+## Security
 
-### Current Performance
-
-| Phase | Duration | Notes |
-|-------|----------|-------|
-| Extraction (parallel) | ~10 min | 4 regions @ ~2.5 min each |
-| Transformation | ~15 min | Pandas + SQLAlchemy |
-| Validation | ~5 min | Quality checks |
-| Snowflake Load | ~10 min | COPY + MERGE |
-| **Total** | **~40 min** | Well under 2-hour SLA |
-
-### Optimization Strategies
-
-1. **Extraction**
-   - Increase parallelism (add more workers)
-   - Use connection pooling
-   - Implement incremental extraction
-
-2. **Transformation**
-   - Use PySpark for large datasets (> 1M records)
-   - Implement partition-based processing
-   - Optimize Pandas operations
-
-3. **Snowflake Load**
-   - Partition data files for parallel loading
-   - Use larger warehouse during load
-   - Implement micro-batch loading
-
----
-
-## Testing
-
-### Unit Tests
-```bash
-# Run unit tests
-pytest tests/test_dag_structure.py
-pytest tests/test_transformations.py
-```
-
-### Integration Tests
-```bash
-# Test with sample data
-airflow dags test retail_sales_etl_pipeline 2024-01-15
-```
-
-### Data Quality Tests
-```sql
--- Verify record counts
-SELECT etl_batch_id, COUNT(*) 
-FROM analytics.sales_fact 
-GROUP BY etl_batch_id;
-
--- Check for duplicates
-SELECT sale_id, COUNT(*) 
-FROM analytics.sales_fact 
-GROUP BY sale_id 
-HAVING COUNT(*) > 1;
-```
-
----
-
-## Security Considerations
-
-1. **Credentials Management**
-   - Store in AWS Secrets Manager / HashiCorp Vault
-   - Never hardcode in DAG files
-   - Rotate credentials regularly
-
-2. **Network Security**
-   - Use VPC peering for database access
-   - Enable SSL/TLS for all connections
-   - Implement IP whitelisting
-
-3. **Data Encryption**
-   - Encrypt data at rest (S3, Snowflake)
-   - Use encrypted connections
-   - PII/sensitive data masking
-
-4. **Access Control**
-   - Principle of least privilege
-   - Role-based access (Snowflake)
-   - Airflow RBAC enabled
-
----
-
-## Interview Talking Points
-
-### Technical Depth
-
-**When discussing this project in interviews:**
-
-1. **Architecture Decisions**
-   - Why parallel extraction? (Reduce overall runtime)
-   - Why PostgreSQL staging? (Easier debugging, transformation flexibility)
-   - Why S3 intermediary? (Snowflake COPY optimization)
-   - Why MERGE vs INSERT? (Idempotency, handle late data)
-
-2. **Data Quality Strategy**
-   - Branch operator for fail-fast approach
-   - Threshold-based validation (not perfect, but practical)
-   - Separation of concerns (extract → transform → validate → load)
-
-3. **Production Considerations**
-   - Retry logic with exponential backoff
-   - SLA monitoring
-   - Comprehensive logging
-   - Graceful error handling
-
-4. **Scale Considerations**
-   - "Currently processes ~500K records/day per region"
-   - "Could scale to 10M+ with PySpark transformation"
-   - "Snowflake warehouse sizing based on load patterns"
-
-### Common Follow-Up Questions
-
-**Q: How do you handle schema changes?**
-```
-A: Implemented envelope pattern with version tracking.
-New columns added with defaults. Breaking changes require
-separate migration DAG.
-```
-
-**Q: What if a regional database is down?**
-```
-A: Extraction tasks retry 3x with backoff. If all fail,
-pipeline proceeds with available data, sends alert.
-Post-recovery, backfill DAG processes missing dates.
-```
-
-**Q: How do you ensure data consistency?**
-```
-A: Batch ID tracking, upsert logic, transaction boundaries.
-Each batch is atomic. Failed batches are rolled back and
-reprocessed.
-```
-
-**Q: Performance at 10x scale?**
-```
-A: Move transformation to PySpark on EMR/Databricks.
-Partition data by region + date. Use Snowflake clustering.
-Parallel file loads to Snowflake.
-```
+| Area | Implementation |
+|------|---------------|
+| **Credentials** | Stored in Airflow connections (backed by Secrets Manager / Vault) |
+| **SQL injection** | All queries use parameterized `%s` placeholders |
+| **Network** | VPC peering for DB access, SSL/TLS for all connections |
+| **Encryption** | Data at rest (S3 SSE, Snowflake), data in transit (TLS) |
+| **Access control** | Snowflake RBAC roles, Airflow RBAC, least-privilege IAM |
+| **Secrets in repo** | `.gitignore` excludes `.env`, credentials, and key files |
 
 ---
 
 ## Future Enhancements
 
-1. **Real-time Streaming**
-   - Add Kafka/Kinesis for real-time ingestion
-   - Implement Lambda architecture (batch + stream)
-
-2. **Advanced Monitoring**
-   - Integrate with Datadog / New Relic
-   - Custom CloudWatch dashboards
-   - Anomaly detection
-
-3. **Machine Learning Integration**
-   - Sales forecasting
-   - Anomaly detection in transactions
-   - Data drift monitoring
-
-4. **Cost Optimization**
-   - Snowflake warehouse auto-scaling
-   - S3 lifecycle policies
-   - Query optimization
+- **Real-time streaming** -- Kafka/Kinesis ingestion alongside batch
+- **Advanced monitoring** -- Datadog/Prometheus metrics, anomaly detection dashboards
+- **PySpark transformation** -- Replace Pandas for datasets > 1M records
+- **Incremental extraction** -- CDC-based extraction instead of full daily scan
+- **Schema registry** -- Formal schema evolution management
+- **Cost optimization** -- Snowflake auto-suspend, S3 lifecycle policies
 
 ---
 
-## Contact & Support
+## Contact
 
-**Maintainer:** Sanath  
-**Team:** Data Engineering  
-**Slack Channel:** `#data-engineering`  
-**Documentation:** [Confluence Link]
-
----
-
-## License
-
-Internal Use Only - Company Proprietary
+| | |
+|---|---|
+| **Maintainer** | Sanath |
+| **Team** | Data Engineering |
+| **Slack** | `#data-engineering` |
