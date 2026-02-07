@@ -32,8 +32,8 @@ from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 # Dynamic region configuration — load from JSON at parse time (fast, no DB hit).
-# To add a new region, edit CONFIGURATIONS/region_config.json and add an Airflow connection.
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'CONFIGURATIONS' / 'region_config.json'
+# To add a new region, edit config/region_config.json and add an Airflow connection.
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config' / 'region_config.json'
 with open(_CONFIG_PATH) as _f:
     _PIPELINE_CONFIG = json.load(_f)
 
