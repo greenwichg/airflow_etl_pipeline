@@ -182,9 +182,9 @@ airflow db init
 source .env
 
 # Run setup script
-python airflow_config_setup.py
+python config/airflow_config_setup.py
 
-# Or manually via CLI (see airflow_config_setup.py for commands)
+# Or manually via CLI (see config/airflow_config_setup.py for commands)
 ```
 
 ### 3. Set Up Airflow Variables
@@ -203,7 +203,7 @@ Via Airflow UI: **Admin → Variables**
 
 ```bash
 # Copy DAG to Airflow DAGs folder
-cp retail_sales_etl_dag.py $AIRFLOW_HOME/dags/
+cp dags/retail_sales_etl_dag.py $AIRFLOW_HOME/dags/
 
 # Validate DAG
 airflow dags list
@@ -216,7 +216,7 @@ airflow dags unpause retail_sales_etl_pipeline
 ### 5. Set Up Snowflake
 
 ```sql
--- Execute setup SQL (see airflow_config_setup.py)
+-- Execute setup SQL (see config/airflow_config_setup.py)
 -- Creates warehouse, database, schema, tables, and roles
 ```
 

@@ -12,8 +12,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__WEBSERVER__SECRET_KEY: change-me-in-production
   volumes:
-    - ./DAGS:/opt/airflow/project/DAGS
-    - ./CONFIGURATIONS:/opt/airflow/project/CONFIGURATIONS
+    - ./dags:/opt/airflow/project/dags
+    - ./config:/opt/airflow/project/config
     - ./logs:/opt/airflow/logs
   depends_on:
     postgres:

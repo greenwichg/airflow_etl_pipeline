@@ -20,7 +20,7 @@ from airflow.utils.state import State
 from airflow.utils.types import DagRunType
 
 # Load the same region config used by the DAG
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'CONFIGURATIONS' / 'region_config.json'
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config' / 'region_config.json'
 with open(_CONFIG_PATH) as _f:
     REGION_CONFIGS = json.load(_f)['regions']
 REGION_NAMES = [r['name'] for r in REGION_CONFIGS]
@@ -33,7 +33,7 @@ class TestDAGStructure:
     @pytest.fixture
     def dagbag(self):
         """Load DAG"""
-        return DagBag(dag_folder='DAGS/', include_examples=False)
+        return DagBag(dag_folder='dags/', include_examples=False)
     
     def test_dag_loaded(self, dagbag):
         """Test that DAG is loaded without errors"""
@@ -271,7 +271,7 @@ class TestRegionConfig:
 
     def test_dag_generates_extract_tasks_from_config(self):
         """DAG should create one extract task per config entry"""
-        dagbag = DagBag(dag_folder='DAGS/', include_examples=False)
+        dagbag = DagBag(dag_folder='dags/', include_examples=False)
         dag = dagbag.get_dag(dag_id='retail_sales_etl_pipeline')
         for region_cfg in REGION_CONFIGS:
             task_id = f'extract_data.extract_{region_cfg["name"]}'

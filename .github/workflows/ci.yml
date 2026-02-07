@@ -26,10 +26,10 @@ jobs:
           pip install ruff
 
       - name: Lint with ruff
-        run: ruff check DAGS/ TEST_SCENARIOS/ CONFIGURATIONS/
+        run: ruff check dags/ tests/ config/
 
       - name: Validate DAG syntax
-        run: python -c "import importlib.util; spec = importlib.util.spec_from_file_location('dag', 'DAGS/retail_sales_etl_dag.py'); mod = importlib.util.module_from_spec(spec)"
+        run: python -c "import importlib.util; spec = importlib.util.spec_from_file_location('dag', 'dags/retail_sales_etl_dag.py'); mod = importlib.util.module_from_spec(spec)"
 
       - name: Run tests
-        run: pytest TEST_SCENARIOS/ -v --tb=short
+        run: pytest tests/ -v --tb=short
