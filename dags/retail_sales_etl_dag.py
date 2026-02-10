@@ -25,7 +25,11 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+try:
+    from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+except ImportError:
+    # Provider >=5.0 removed SnowflakeOperator; use the common SQL operator.
+    from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator as SnowflakeOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
@@ -774,7 +778,7 @@ with DAG(
 
     stage_to_snowflake = SnowflakeOperator(
         task_id='stage_data_in_snowflake',
-        snowflake_conn_id='snowflake_default',
+        conn_id='snowflake_default',
         sql=f"""
         -- Create staging table if not exists
         CREATE TABLE IF NOT EXISTS {SNOWFLAKE_STAGE_TABLE} (
@@ -831,7 +835,7 @@ with DAG(
 
     merge_to_final = SnowflakeOperator(
         task_id='merge_to_final_table',
-        snowflake_conn_id='snowflake_default',
+        conn_id='snowflake_default',
         sql=f"""
         -- Create final table if not exists
         CREATE TABLE IF NOT EXISTS {SNOWFLAKE_FINAL_TABLE} (
