@@ -10,14 +10,12 @@ Run with: pytest test_retail_sales_etl.py -v
 import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 import pandas as pd
 import json
 
 # Import Airflow components
 from airflow.models import DagBag
-from airflow.utils.state import State
-from airflow.utils.types import DagRunType
 
 # Load the same region config used by the DAG
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config' / 'region_config.json'
