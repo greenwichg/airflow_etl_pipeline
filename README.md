@@ -1,27 +1,30 @@
 # Retail Sales ETL Pipeline
 
-**Production-grade Apache Airflow pipeline** that extracts sales data from multiple regional PostgreSQL databases, transforms it into a unified schema, validates data quality, and loads it into Snowflake for enterprise analytics.
+**Production-grade Apache Airflow pipeline with Change Data Capture (CDC)** that extracts sales data from multiple regional PostgreSQL databases, transforms it into a unified schema, validates data quality, and loads it into Snowflake for enterprise analytics. Supports both **batch (Airflow)** and **real-time (Debezium + Kafka + Snowpipe)** ingestion paths.
 
 | | |
 |---|---|
-| **Schedule** | Daily at 06:00 UTC |
-| **SLA** | 2 hours |
+| **Schedule** | Daily at 06:00 UTC (batch) / Real-time (CDC) |
+| **SLA** | 2 hours (batch) / < 2 min latency (CDC) |
 | **Throughput** | ~2M records/day across 4 regions |
-| **Runtime** | ~40 minutes |
+| **Runtime** | ~40 minutes (batch) |
 | **Orchestrator** | Apache Airflow 2.5+ |
-| **Warehouse** | Snowflake |
+| **CDC** | Debezium + Kafka + Snowpipe Streaming |
+| **Warehouse** | Snowflake (Streams & Tasks) |
 
 ---
 
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [CDC Architecture](#cdc-architecture)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
 - [DAG Flow](#dag-flow)
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [CDC Setup](#cdc-setup)
 - [Data Quality](#data-quality)
 - [Testing](#testing)
 - [Performance](#performance)
@@ -33,44 +36,52 @@
 
 ## Architecture
 
-### High-Level Data Flow
+### Dual-Path Data Flow (Batch + CDC)
 
 ```mermaid
 graph LR
-    subgraph Sources["Regional Databases"]
-        PG1[(US East<br/>PostgreSQL)]
-        PG2[(US West<br/>PostgreSQL)]
-        PG3[(Europe<br/>PostgreSQL)]
-        PG4[(APAC<br/>PostgreSQL)]
+    subgraph Sources["Regional Databases (PostgreSQL)"]
+        PG1[(US East)]
+        PG2[(US West)]
+        PG3[(Europe)]
+        PG4[(APAC)]
     end
 
-    subgraph Airflow["Airflow Orchestration"]
-        EXT["Parallel<br/>Extraction"]
+    subgraph BatchPath["PATH 1: Batch (Airflow)"]
+        EXT["Incremental<br/>Extraction<br/>(updated_at)"]
         TRN["Transform<br/>& Unify"]
         VAL{"Data Quality<br/>Validation"}
     end
 
-    subgraph Staging
-        STG[(PostgreSQL<br/>Staging)]
-        S3[(S3<br/>Bucket)]
+    subgraph CDCPath["PATH 2: Real-Time (Debezium + Kafka)"]
+        DBZ["Debezium<br/>Connectors"]
+        KFK["Kafka<br/>Topics"]
+        SNP["Snowpipe<br/>Streaming"]
     end
 
     subgraph Warehouse["Snowflake"]
-        SF_STG[Stage Table]
+        SF_STG[Staging Tables]
+        STREAM["Streams"]
+        TASK["Tasks"]
         SF_FINAL[(analytics.sales_fact)]
     end
 
     PG1 & PG2 & PG3 & PG4 --> EXT
-    EXT --> STG --> TRN --> VAL
-    VAL -->|Pass| S3 --> SF_STG -->|MERGE| SF_FINAL
+    PG1 & PG2 & PG3 & PG4 -.->|WAL| DBZ
+
+    EXT --> TRN --> VAL -->|Pass| SF_STG
+    DBZ --> KFK --> SNP --> SF_STG
+    SF_STG --> STREAM --> TASK -->|CDC MERGE| SF_FINAL
     VAL -->|Fail| ALERT[Alert & Skip]
 
     style VAL fill:#ffeb3b
     style ALERT fill:#f44336,color:#fff
     style SF_FINAL fill:#4caf50,color:#fff
+    style CDCPath fill:#fff3e0
+    style BatchPath fill:#e3f2fd
 ```
 
-### End-to-End Pipeline
+### Batch Pipeline (Airflow)
 
 ```
  Regional DBs          Airflow                 Staging              Snowflake
@@ -86,16 +97,97 @@ graph LR
  | PostgreSQL|    | us_west      |       +------+------+    +----------+    +----+-----+
  +-----------+    +--------------+              |                                |
                                           +-----v------+                   +-----v-----+
- +-----------+    +--------------+        | Transform  |                   |   MERGE   |
- | Europe    |--->| extract_     |---+    | & validate |                   | (upsert)  |
- | PostgreSQL|    | europe       |   |    +------------+                   +-----+-----+
- +-----------+    +--------------+   |                                           |
-                                     |                                     +-----v-----+
- +-----------+    +--------------+   |                                     | analytics |
- | APAC      |--->| extract_     |---+                                     | .sales_   |
- | PostgreSQL|    | asia_pacific |                                         | fact      |
- +-----------+    +--------------+                                         +-----------+
+ +-----------+    +--------------+        | Transform  |                   | CDC MERGE |
+ | Europe    |--->| extract_     |---+    | & validate |                   | (upsert + |
+ | PostgreSQL|    | europe       |   |    +------------+                   |  delete)  |
+ +-----------+    +--------------+   |                                     +-----+-----+
+                                     |                                           |
+ +-----------+    +--------------+   |                                     +-----v-----+
+ | APAC      |--->| extract_     |---+                                     | analytics |
+ | PostgreSQL|    | asia_pacific |                                         | .sales_   |
+ +-----------+    +--------------+                                         | fact      |
+                                                                           +-----------+
 ```
+
+---
+
+## CDC Architecture
+
+The pipeline implements **three layers of Change Data Capture (CDC)**, each addressing a different latency and complexity requirement:
+
+### Layer 1: Timestamp-Based Incremental Extraction (Airflow)
+
+The batch DAG uses `updated_at` timestamp windows instead of `sale_date` filters, capturing **all changes** (inserts, updates, soft-deletes) that occurred since the last run:
+
+```sql
+-- Old: missed back-dated edits
+WHERE DATE(sale_date) = '2024-01-15'
+
+-- New: captures every change in the window
+WHERE updated_at >= '2024-01-15 00:00:00'
+  AND updated_at <  '2024-01-16 00:00:00'
+```
+
+Soft-deleted rows (`is_deleted = TRUE`) flow through the pipeline and are propagated as `DELETE` operations in the Snowflake MERGE.
+
+### Layer 2: Debezium + Kafka (Real-Time Streaming)
+
+```mermaid
+graph LR
+    subgraph PG["PostgreSQL (per region)"]
+        WAL["WAL<br/>(pgoutput)"]
+    end
+
+    subgraph Connect["Kafka Connect"]
+        DBZ["Debezium<br/>Source<br/>Connector"]
+        SINK["Snowflake<br/>Sink<br/>Connector"]
+    end
+
+    subgraph Kafka
+        T["cdc.retail.sales<br/>.transactions"]
+        SR["Schema<br/>Registry"]
+    end
+
+    subgraph SF["Snowflake"]
+        RAW["CDC_SALES_EVENTS<br/>(raw JSON)"]
+    end
+
+    WAL -->|Logical Replication| DBZ
+    DBZ --> T
+    T --> SINK
+    SINK -->|Snowpipe Streaming| RAW
+    T --- SR
+
+    style T fill:#ff9800,color:#fff
+    style RAW fill:#4caf50,color:#fff
+```
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Source connectors** | Debezium 2.4 (PostgreSQL) | Reads WAL, emits change events per region |
+| **Message bus** | Apache Kafka (Confluent 7.5) | Durable, ordered event stream |
+| **Schema management** | Confluent Schema Registry | Avro schemas, backward compatibility |
+| **Sink connector** | Snowflake Kafka Connector | Snowpipe Streaming into staging |
+| **Dead letter queue** | Kafka DLQ topics | Captures failed events for replay |
+
+### Layer 3: Snowflake Streams & Tasks (Autonomous Processing)
+
+```mermaid
+graph TD
+    RAW["CDC_SALES_EVENTS<br/>(raw Debezium JSON)"] --> SA["Stream A<br/>STREAM_CDC_RAW_EVENTS"]
+    SA -->|"Task A (1 min)"| PARSE["PARSE_CDC_EVENTS"]
+    PARSE --> STG["SALES_DATA_STAGE<br/>(parsed rows)"]
+    STG --> SB["Stream B<br/>STREAM_SALES_STAGED"]
+    SB -->|"Task B (child)"| MERGE["MERGE_TO_SALES_FACT"]
+    MERGE --> FINAL["ANALYTICS.SALES_FACT"]
+    MERGE --> AUDIT["AUDIT.CDC_MERGE_LOG"]
+
+    style RAW fill:#fff3e0
+    style FINAL fill:#4caf50,color:#fff
+    style AUDIT fill:#e3f2fd
+```
+
+Tasks run **autonomously** -- no Airflow scheduling needed. They activate only when streams detect new data (`SYSTEM$STREAM_HAS_DATA()`), avoiding wasted compute.
 
 ---
 
@@ -105,14 +197,29 @@ graph LR
 airflow_etl_pipeline/
 |
 |-- dags/
-|   +-- retail_sales_etl_dag.py        # Main DAG: extraction, transform, validate, load
+|   +-- retail_sales_etl_dag.py        # Main DAG: CDC extraction, transform, validate, load
 |
 |-- config/
 |   |-- region_config.json             # Dynamic region definitions (add regions here)
-|   +-- airflow_config_setup.py        # Connection & variable setup helpers
+|   |-- airflow_config_setup.py        # Connection & variable setup helpers
+|   +-- debezium/
+|       |-- connector_us_east.json     # Debezium source connector (US East)
+|       |-- connector_us_west.json     # Debezium source connector (US West)
+|       |-- connector_europe.json      # Debezium source connector (Europe)
+|       |-- connector_asia_pacific.json  # Debezium source connector (APAC)
+|       +-- snowflake_sink_connector.json  # Snowpipe Streaming sink connector
+|
+|-- sql/
+|   |-- 01_postgresql_cdc_setup.sql    # WAL config, replication user, publications
+|   |-- 02_snowflake_cdc_tables.sql    # CDC events, staging, fact, audit tables
+|   |-- 03_snowflake_streams.sql       # Streams on staging tables
+|   +-- 04_snowflake_tasks.sql         # Automated parse + merge tasks
+|
+|-- scripts/
+|   +-- deploy_connectors.sh           # Deploy all Kafka Connect connectors
 |
 |-- tests/
-|   +-- test_retail_sales_etl.py       # Unit tests: DAG structure, transforms, quality
+|   +-- test_retail_sales_etl.py       # Unit tests: DAG, transforms, quality, CDC
 |
 |-- docs/
 |   |-- architecture_diagrams.md       # Mermaid architecture diagrams
@@ -125,7 +232,7 @@ airflow_etl_pipeline/
 |   +-- ci.yml                         # CI: lint, DAG validation, tests
 |
 |-- Dockerfile                         # Airflow image with project deps
-|-- docker-compose.yml                 # Local dev stack (Airflow + PostgreSQL)
+|-- docker-compose.yml                 # Full stack: Airflow + Kafka + Debezium
 |-- requirements.txt                   # Pinned Python dependencies
 |-- .gitignore
 +-- README.md
@@ -138,15 +245,20 @@ airflow_etl_pipeline/
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | **Orchestration** | Apache Airflow 2.5+ | DAG scheduling, task management, retries |
-| **Source DBs** | PostgreSQL 12+ | 4 regional transactional databases |
+| **Source DBs** | PostgreSQL 12+ (WAL) | 4 regional transactional databases |
+| **CDC Capture** | Debezium 2.4 | Reads PostgreSQL WAL via logical replication |
+| **Message Bus** | Apache Kafka 7.5 | Durable, ordered CDC event stream |
+| **Schema Mgmt** | Confluent Schema Registry | Avro schema evolution |
 | **Staging DB** | PostgreSQL 12+ | Intermediate transformation storage |
 | **Processing** | Python / Pandas | Data consolidation, cleaning, enrichment |
 | **Object Storage** | AWS S3 | Staging area for Snowflake COPY |
-| **Data Warehouse** | Snowflake | Final analytics tables with clustering |
+| **Data Warehouse** | Snowflake | Streams, Tasks, and final analytics tables |
+| **Streaming Ingest** | Snowpipe Streaming | Real-time Kafka-to-Snowflake ingestion |
 | **Bulk Insert** | SQLAlchemy | Parameterized batch writes to PostgreSQL |
-| **Testing** | pytest | Unit, config, and integration tests |
+| **Testing** | pytest | Unit, config, CDC, and integration tests |
 | **CI/CD** | GitHub Actions | Lint (ruff), DAG validation, test suite |
-| **Containers** | Docker / Compose | Reproducible local development |
+| **Containers** | Docker / Compose | Full stack: Airflow + Kafka + Debezium |
+| **Monitoring** | Kafka UI | Topic inspection, consumer lag, connector status |
 
 ---
 
@@ -224,13 +336,23 @@ Regions are defined in `config/region_config.json`. Adding a new region requires
 | Region normalization | `us_east` -> `US-EAST` (config-driven) |
 | Business rules | Filter `quantity > 0`, `unit_price > 0`, `total_amount > 0` |
 
-### Idempotent Loads
-- MERGE (upsert) into `analytics.sales_fact` -- safe for reruns
+### CDC-Aware Loads
+- **MERGE** with 3-way branch: `INSERT` new rows, `UPDATE` modified rows, `DELETE` soft-deleted rows
+- `is_deleted` flag flows end-to-end from source through staging to Snowflake
 - Batch ID (`etl_batch_id`) tracks each execution date
 - DELETE + INSERT staging pattern ensures clean intermediate state
 
+### Incremental Extraction
+Extraction uses `updated_at` timestamp windows instead of `sale_date` filters, capturing back-dated edits, late-arriving corrections, and soft-deletes that traditional date-partition extraction misses.
+
+### Real-Time CDC Pipeline
+Debezium reads the PostgreSQL WAL (logical replication) and streams every INSERT, UPDATE, and DELETE to Kafka. The Snowflake Kafka Connector ingests events via Snowpipe Streaming with < 2 min end-to-end latency.
+
+### Snowflake Autonomous Processing
+Snowflake Streams and Tasks process CDC events automatically without external scheduling. Tasks activate only when streams detect new data, eliminating idle compute costs.
+
 ### Parameterized SQL
-All runtime values (`target_date`, `batch_id`, `region`) use `%s` placeholders via `cursor.execute(query, params)` -- no f-string interpolation in SQL.
+All runtime values (`window_start`, `window_end`, `batch_id`, `region`) use `%s` placeholders via `cursor.execute(query, params)` -- no f-string interpolation in SQL.
 
 ### Fail-Fast Validation
 `BranchPythonOperator` gates the Snowflake load behind multi-layer quality checks. On failure, the pipeline skips loading and sends alerts.
@@ -244,11 +366,17 @@ All runtime values (`target_date`, `batch_id`, `region`) use `%s` placeholders v
 ```bash
 git clone <repo-url> && cd airflow_etl_pipeline
 
-# Start Airflow + PostgreSQL
+# Start full stack: Airflow + Kafka + Debezium + Schema Registry
 docker compose up -d
 
 # Open Airflow UI
 open http://localhost:8080    # admin / admin
+
+# Open Kafka UI (optional)
+open http://localhost:8084
+
+# Deploy CDC connectors (after services are healthy)
+./scripts/deploy_connectors.sh
 ```
 
 ### Option B: Local
@@ -321,6 +449,76 @@ Each entry generates an extraction task dynamically:
 
 ---
 
+## CDC Setup
+
+### 1. PostgreSQL Logical Replication
+
+Run on each regional database (see `sql/01_postgresql_cdc_setup.sql`):
+
+```bash
+# Verify WAL level
+psql -c "SHOW wal_level;"  # Must be 'logical'
+
+# Create replication user and publication
+psql -f sql/01_postgresql_cdc_setup.sql
+```
+
+### 2. Start Infrastructure
+
+```bash
+# Start full stack: Airflow + Kafka + Debezium + Schema Registry
+docker compose up -d
+
+# Verify all services are healthy
+docker compose ps
+```
+
+| Service | Port | URL |
+|---------|------|-----|
+| Airflow UI | 8080 | http://localhost:8080 |
+| Schema Registry | 8081 | http://localhost:8081 |
+| Kafka Connect | 8083 | http://localhost:8083 |
+| Kafka UI | 8084 | http://localhost:8084 |
+| Kafka Broker | 9092 | -- |
+
+### 3. Deploy Connectors
+
+```bash
+# Set database credentials
+export POSTGRES_US_EAST_HOST=us-east-db.company.com
+export POSTGRES_US_EAST_USER=debezium_replication
+export POSTGRES_US_EAST_PASSWORD=...
+# (repeat for all regions)
+
+export SNOWFLAKE_ACCOUNT=my_account
+export SNOWFLAKE_USER=etl_user
+export SNOWFLAKE_PRIVATE_KEY=...
+
+# Deploy all connectors
+./scripts/deploy_connectors.sh
+
+# Verify
+curl localhost:8083/connectors | python3 -m json.tool
+```
+
+### 4. Snowflake Streams & Tasks
+
+```bash
+# Run SQL scripts in order
+snowsql -f sql/02_snowflake_cdc_tables.sql
+snowsql -f sql/03_snowflake_streams.sql
+snowsql -f sql/04_snowflake_tasks.sql
+```
+
+Tasks activate automatically. Monitor with:
+```sql
+SELECT * FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE NAME IN ('PARSE_CDC_EVENTS', 'MERGE_TO_SALES_FACT')
+ORDER BY SCHEDULED_TIME DESC LIMIT 20;
+```
+
+---
+
 ## Data Quality
 
 ### Validation Gates
@@ -375,11 +573,12 @@ pytest tests/test_retail_sales_etl.py::TestDataTransformation -v
 | `TestRegionConfig` | 5 | Config file validity, required fields, uniqueness, task generation |
 | `TestDataTransformation` | 5 | Deduplication, null handling, derived columns, partitions, regions |
 | `TestDataQuality` | 3 | Record thresholds, null %, business rule validation |
-| `TestExtractionLogic` | 2 | Parameterized query format, error handling |
-| `TestSnowflakeOperations` | 2 | MERGE structure, upsert logic |
-| `TestMonitoringAndLogging` | 2 | XCom metadata, transformation metadata |
+| `TestExtractionLogic` | 2 | Timestamp window query, error handling |
+| `TestSnowflakeOperations` | 2 | CDC MERGE structure, upsert logic |
+| `TestMonitoringAndLogging` | 2 | XCom metadata, transformation metadata (with delete_markers) |
 | `TestErrorScenarios` | 2 | Zero records, partial region failure |
 | `TestPerformance` | 1 | Parallel vs sequential extraction benefit |
+| `TestCDCLogic` | 8 | Live/delete split, delete passthrough, timestamp window, CDC upsert+delete, Debezium configs, Snowflake sink config, SQL scripts |
 
 ### CI Pipeline (`.github/workflows/ci.yml`)
 
@@ -482,12 +681,14 @@ DELETE FROM analytics.sales_fact WHERE etl_batch_id = '20240115';
 
 ## Future Enhancements
 
-- **Real-time streaming** -- Kafka/Kinesis ingestion alongside batch
+- ~~**Real-time streaming**~~ -- Implemented (Debezium + Kafka + Snowpipe Streaming)
+- ~~**Incremental extraction**~~ -- Implemented (timestamp-based `updated_at` window)
+- ~~**Schema registry**~~ -- Implemented (Confluent Schema Registry with Avro)
 - **Advanced monitoring** -- Datadog/Prometheus metrics, anomaly detection dashboards
 - **PySpark transformation** -- Replace Pandas for datasets > 1M records
-- **Incremental extraction** -- CDC-based extraction instead of full daily scan
-- **Schema registry** -- Formal schema evolution management
 - **Cost optimization** -- Snowflake auto-suspend, S3 lifecycle policies
+- **Multi-topic routing** -- Separate Kafka topics per region for independent scaling
+- **Exactly-once semantics** -- Kafka transactions + Snowflake task idempotency tokens
 
 ---
 

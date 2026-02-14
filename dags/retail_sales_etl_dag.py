@@ -92,14 +92,22 @@ def extract_sales_data_from_region(region: str, conn_id: str, execution_date: st
     if region not in REGION_NAMES:
         raise ValueError(f"Invalid region: {region}")
 
-    # Parse execution date
+    # Parse execution window for incremental CDC extraction.
+    # Instead of filtering on sale_date (misses back-dated edits), we use
+    # updated_at which captures every INSERT, UPDATE, and soft-delete change
+    # that occurred since the previous DAG run.
     exec_date = datetime.strptime(execution_date, '%Y-%m-%d')
-    target_date = (exec_date - timedelta(days=1)).strftime('%Y-%m-%d')
+    window_start = (exec_date - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    window_end = exec_date.strftime('%Y-%m-%d %H:%M:%S')
     batch_id = execution_date.replace('-', '')
 
-    logger.info(f"Extracting sales data for region: {region}, date: {target_date}")
+    logger.info(
+        f"Incremental extraction for {region}: updated_at in [{window_start}, {window_end})"
+    )
 
-    # Step 1: Extract from regional database using parameterized query
+    # Step 1: Extract changes from regional database using timestamp window.
+    # This captures new rows, modified rows, and soft-deleted rows within
+    # the window so downstream logic can apply deletes to the target.
     regional_hook = PostgresHook(postgres_conn_id=conn_id)
     regional_conn = regional_hook.get_conn()
     try:
@@ -109,21 +117,22 @@ def extract_sales_data_from_region(region: str, conn_id: str, execution_date: st
                 sale_id, customer_id, product_id, sale_date,
                 quantity, unit_price, total_amount,
                 store_id, payment_method, discount_amount,
-                tax_amount, created_at, updated_at
+                tax_amount, created_at, updated_at,
+                is_deleted
             FROM sales.transactions
-            WHERE DATE(sale_date) = %s
-                AND is_deleted = FALSE
+            WHERE updated_at >= %s
+                AND updated_at < %s
                 AND status = 'completed'
             ORDER BY sale_id;
         """
-        regional_cursor.execute(extraction_query, (target_date,))
+        regional_cursor.execute(extraction_query, (window_start, window_end))
         records = regional_cursor.fetchall()
         record_count = len(records)
         regional_cursor.close()
     finally:
         regional_conn.close()
 
-    logger.info(f"Extracted {record_count} records from {region}")
+    logger.info(f"Extracted {record_count} changed records from {region}")
 
     # Store extracted data count in XCom for downstream tasks
     context['task_instance'].xcom_push(
@@ -138,7 +147,7 @@ def extract_sales_data_from_region(region: str, conn_id: str, execution_date: st
         try:
             staging_cursor = staging_conn.cursor()
 
-            # Create persistent staging table if not exists
+            # Create persistent staging table if not exists (includes is_deleted for CDC)
             staging_cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS {EXTRACT_STAGING_TABLE} (
                     sale_id BIGINT,
@@ -154,6 +163,7 @@ def extract_sales_data_from_region(region: str, conn_id: str, execution_date: st
                     tax_amount DECIMAL(10,2),
                     created_at TIMESTAMP,
                     updated_at TIMESTAMP,
+                    is_deleted BOOLEAN DEFAULT FALSE,
                     region VARCHAR(50),
                     etl_batch_id VARCHAR(20)
                 );
@@ -250,57 +260,77 @@ def transform_sales_data(execution_date: str, **context) -> Dict[str, Any]:
 
     # ====== TRANSFORMATIONS ======
 
-    # 1. Remove duplicates based on sale_id
-    initial_count = len(combined_df)
-    combined_df = combined_df.drop_duplicates(subset=['sale_id'], keep='first')
-    dedup_count = initial_count - len(combined_df)
+    # 0. Separate soft-deleted rows — these pass straight through for CDC
+    #    delete propagation in the downstream MERGE.
+    delete_df = combined_df[combined_df['is_deleted'] == True].copy()  # noqa: E712
+    live_df = combined_df[combined_df['is_deleted'] == False].copy()  # noqa: E712
+    logger.info(
+        f"CDC split: {len(live_df)} live rows, {len(delete_df)} delete markers"
+    )
+
+    # 1. Remove duplicates based on sale_id (keep latest by updated_at)
+    initial_count = len(live_df)
+    live_df = live_df.sort_values('updated_at', ascending=False)
+    live_df = live_df.drop_duplicates(subset=['sale_id'], keep='first')
+    dedup_count = initial_count - len(live_df)
     logger.info(f"Removed {dedup_count} duplicate records")
 
     # 2. Standardize data types
-    combined_df['sale_date'] = pd.to_datetime(combined_df['sale_date'])
-    combined_df['created_at'] = pd.to_datetime(combined_df['created_at'])
-    combined_df['updated_at'] = pd.to_datetime(combined_df['updated_at'])
+    live_df['sale_date'] = pd.to_datetime(live_df['sale_date'])
+    live_df['created_at'] = pd.to_datetime(live_df['created_at'])
+    live_df['updated_at'] = pd.to_datetime(live_df['updated_at'])
 
     # 3. Handle missing values with business rules
-    combined_df['discount_amount'] = combined_df['discount_amount'].fillna(0)
-    combined_df['tax_amount'] = combined_df['tax_amount'].fillna(0)
+    live_df['discount_amount'] = live_df['discount_amount'].fillna(0)
+    live_df['tax_amount'] = live_df['tax_amount'].fillna(0)
 
     # 4. Add derived columns
-    combined_df['net_amount'] = (
-        combined_df['total_amount'] -
-        combined_df['discount_amount']
+    live_df['net_amount'] = (
+        live_df['total_amount'] -
+        live_df['discount_amount']
     )
 
-    combined_df['gross_profit'] = (
-        combined_df['net_amount'] -
-        combined_df['tax_amount']
+    live_df['gross_profit'] = (
+        live_df['net_amount'] -
+        live_df['tax_amount']
     )
 
     # 5. Add partition columns for efficient querying in Snowflake
-    combined_df['sale_year'] = combined_df['sale_date'].dt.year
-    combined_df['sale_month'] = combined_df['sale_date'].dt.month
-    combined_df['sale_day'] = combined_df['sale_date'].dt.day
+    live_df['sale_year'] = live_df['sale_date'].dt.year
+    live_df['sale_month'] = live_df['sale_date'].dt.month
+    live_df['sale_day'] = live_df['sale_date'].dt.day
 
     # 6. Add processing metadata
-    combined_df['etl_loaded_at'] = datetime.now()
-    combined_df['etl_batch_id'] = batch_id
+    live_df['etl_loaded_at'] = datetime.now()
+    live_df['etl_batch_id'] = batch_id
 
     # 7. Normalize region names (driven by region_config.json)
-    combined_df['region'] = combined_df['region'].map(REGION_DISPLAY_MAP)
+    live_df['region'] = live_df['region'].map(REGION_DISPLAY_MAP)
 
-    # 8. Data validation
-    combined_df = combined_df[combined_df['quantity'] > 0]
-    combined_df = combined_df[combined_df['unit_price'] > 0]
-    combined_df = combined_df[combined_df['total_amount'] > 0]
+    # 8. Data validation (only on live rows)
+    live_df = live_df[live_df['quantity'] > 0]
+    live_df = live_df[live_df['unit_price'] > 0]
+    live_df = live_df[live_df['total_amount'] > 0]
 
-    transformed_count = len(combined_df)
-    logger.info(f"Transformation complete. Final record count: {transformed_count}")
+    # 9. Prepare delete markers with minimal columns needed for MERGE
+    if not delete_df.empty:
+        delete_df['etl_loaded_at'] = datetime.now()
+        delete_df['etl_batch_id'] = batch_id
+        delete_df['region'] = delete_df['region'].map(REGION_DISPLAY_MAP)
+
+    # Recombine live rows + delete markers for downstream staging
+    combined_df = pd.concat([live_df, delete_df], ignore_index=True)
+    transformed_count = len(live_df)
+    delete_count = len(delete_df)
+    logger.info(
+        f"Transformation complete. {transformed_count} live, {delete_count} deletes"
+    )
 
     # Store transformed data back to staging table
     conn = pg_hook.get_conn()
     cursor = conn.cursor()
     try:
-        # Create staging table
+        # Create staging table (includes is_deleted for CDC delete propagation)
         create_staging = f"""
         CREATE TABLE IF NOT EXISTS {EXTRACTION_TABLE} (
             sale_id BIGINT PRIMARY KEY,
@@ -320,6 +350,7 @@ def transform_sales_data(execution_date: str, **context) -> Dict[str, Any]:
             sale_year INTEGER,
             sale_month INTEGER,
             sale_day INTEGER,
+            is_deleted BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP,
             updated_at TIMESTAMP,
             etl_loaded_at TIMESTAMP,
@@ -355,6 +386,7 @@ def transform_sales_data(execution_date: str, **context) -> Dict[str, Any]:
         'total_extracted': total_extracted,
         'duplicates_removed': dedup_count,
         'transformed_records': transformed_count,
+        'delete_markers': delete_count,
         'execution_date': execution_date,
         'status': 'success'
     }
@@ -780,7 +812,7 @@ with DAG(
         task_id='stage_data_in_snowflake',
         conn_id='snowflake_default',
         sql=f"""
-        -- Create staging table if not exists
+        -- Create staging table if not exists (includes is_deleted for CDC)
         CREATE TABLE IF NOT EXISTS {SNOWFLAKE_STAGE_TABLE} (
             sale_id BIGINT,
             customer_id VARCHAR(50),
@@ -801,6 +833,7 @@ with DAG(
             sale_day INTEGER,
             created_at TIMESTAMP,
             updated_at TIMESTAMP,
+            is_deleted BOOLEAN DEFAULT FALSE,
             etl_loaded_at TIMESTAMP,
             etl_batch_id VARCHAR(20)
         );
@@ -863,11 +896,13 @@ with DAG(
         )
         CLUSTER BY (sale_date, region);
 
-        -- Merge staging data into final table (upsert)
+        -- CDC-aware merge: upsert live rows, delete soft-deleted rows
         MERGE INTO {SNOWFLAKE_FINAL_TABLE} target
         USING {SNOWFLAKE_STAGE_TABLE} source
         ON target.sale_id = source.sale_id
-        WHEN MATCHED THEN
+        WHEN MATCHED AND source.is_deleted = TRUE THEN
+            DELETE
+        WHEN MATCHED AND source.is_deleted = FALSE THEN
             UPDATE SET
                 customer_id = source.customer_id,
                 product_id = source.product_id,
@@ -885,7 +920,7 @@ with DAG(
                 updated_at = source.updated_at,
                 etl_loaded_at = source.etl_loaded_at,
                 etl_batch_id = source.etl_batch_id
-        WHEN NOT MATCHED THEN
+        WHEN NOT MATCHED AND source.is_deleted = FALSE THEN
             INSERT (
                 sale_id, customer_id, product_id, sale_date, quantity,
                 unit_price, total_amount, region, store_id, payment_method,

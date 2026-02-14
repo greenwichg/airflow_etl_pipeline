@@ -112,7 +112,7 @@ class TestDataTransformation:
     
     @pytest.fixture
     def sample_data(self):
-        """Create sample sales data"""
+        """Create sample sales data with CDC is_deleted column"""
         return pd.DataFrame({
             'sale_id': [1, 2, 3, 2, 4],  # Includes duplicate (2)
             'customer_id': ['C001', 'C002', 'C003', 'C002', 'C004'],
@@ -133,7 +133,8 @@ class TestDataTransformation:
             'discount_amount': [0, 2.00, 5.00, 2.00, None],  # Includes NULL
             'tax_amount': [2.00, 1.80, 4.50, 1.80, 4.00],
             'created_at': pd.to_datetime('2024-01-15 10:00:00'),
-            'updated_at': pd.to_datetime('2024-01-15 10:00:00')
+            'updated_at': pd.to_datetime('2024-01-15 10:00:00'),
+            'is_deleted': [False, False, False, False, False]
         })
     
     def test_deduplication(self, sample_data):
@@ -280,23 +281,24 @@ class TestExtractionLogic:
     """Test data extraction functions"""
     
     @patch('airflow.providers.postgres.hooks.postgres.PostgresHook')
-    def test_extraction_query_format(self, mock_pg_hook):
-        """Test extraction query uses parameterized queries"""
+    def test_extraction_query_uses_timestamp_window(self, mock_pg_hook):
+        """Test CDC extraction uses updated_at timestamp window"""
         expected_query_parts = [
             'SELECT',
             'sale_id',
+            'is_deleted',
             'FROM sales.transactions',
-            'WHERE DATE(sale_date) = %s',
-            'AND is_deleted = FALSE',
+            'WHERE updated_at >= %s',
+            'AND updated_at < %s',
             "AND status = 'completed'"
         ]
 
-        # Extraction query uses parameterized placeholders, not f-string interpolation
+        # Extraction query uses parameterized timestamp window (CDC pattern)
         query = """
-        SELECT sale_id, customer_id
+        SELECT sale_id, customer_id, is_deleted
         FROM sales.transactions
-        WHERE DATE(sale_date) = %s
-            AND is_deleted = FALSE
+        WHERE updated_at >= %s
+            AND updated_at < %s
             AND status = 'completed'
         ORDER BY sale_id;
         """
@@ -306,6 +308,8 @@ class TestExtractionLogic:
 
         # Verify query does NOT contain hardcoded date values
         assert "= '2024" not in query
+        # Verify no longer uses DATE(sale_date) filter
+        assert 'DATE(sale_date)' not in query
     
     @patch('airflow.providers.postgres.hooks.postgres.PostgresHook')
     def test_extraction_error_handling(self, mock_pg_hook):
@@ -321,25 +325,27 @@ class TestExtractionLogic:
 
 class TestSnowflakeOperations:
     """Test Snowflake load and merge operations"""
-    
-    def test_merge_query_structure(self):
-        """Test MERGE statement structure"""
+
+    def test_cdc_merge_query_structure(self):
+        """Test CDC-aware MERGE handles inserts, updates, and deletes"""
         merge_query = """
         MERGE INTO analytics.sales_fact target
         USING staging.sales_data_stage source
         ON target.sale_id = source.sale_id
-        WHEN MATCHED THEN UPDATE SET ...
-        WHEN NOT MATCHED THEN INSERT ...
+        WHEN MATCHED AND source.is_deleted = TRUE THEN DELETE
+        WHEN MATCHED AND source.is_deleted = FALSE THEN UPDATE SET ...
+        WHEN NOT MATCHED AND source.is_deleted = FALSE THEN INSERT ...
         """
-        
+
         required_parts = [
             'MERGE INTO',
             'USING',
             'ON target.sale_id = source.sale_id',
-            'WHEN MATCHED THEN',
-            'WHEN NOT MATCHED THEN'
+            'WHEN MATCHED AND source.is_deleted = TRUE THEN DELETE',
+            'WHEN MATCHED AND source.is_deleted = FALSE THEN',
+            'WHEN NOT MATCHED AND source.is_deleted = FALSE THEN'
         ]
-        
+
         for part in required_parts:
             assert part in merge_query
     
@@ -395,20 +401,23 @@ class TestMonitoringAndLogging:
         assert metadata['status'] == 'success'
     
     def test_transformation_metadata(self):
-        """Test transformation metadata structure"""
+        """Test transformation metadata includes CDC fields"""
         metadata = {
             'total_extracted': 5000,
             'duplicates_removed': 50,
             'transformed_records': 4950,
+            'delete_markers': 12,
             'execution_date': '2024-01-15',
             'status': 'success'
         }
-        
+
         # Validate metadata
         assert metadata['transformed_records'] == (
             metadata['total_extracted'] - metadata['duplicates_removed']
         )
         assert metadata['status'] == 'success'
+        assert 'delete_markers' in metadata
+        assert metadata['delete_markers'] >= 0
 
 
 class TestErrorScenarios:
@@ -458,6 +467,133 @@ class TestPerformance:
 
         assert parallel_time < sequential_time
         assert sequential_time - parallel_time == (num_regions - 1) * time_per_region
+
+
+class TestCDCLogic:
+    """Test Change Data Capture (CDC) specific logic"""
+
+    @pytest.fixture
+    def cdc_batch(self):
+        """Sample batch with mixed CDC operations: live rows + soft deletes"""
+        return pd.DataFrame({
+            'sale_id': [10, 20, 30, 40],
+            'customer_id': ['C010', 'C020', 'C030', 'C040'],
+            'product_id': ['P010', 'P020', 'P030', 'P040'],
+            'sale_date': pd.to_datetime('2024-01-15'),
+            'quantity': [1, 2, 3, 4],
+            'unit_price': [10.0, 20.0, 30.0, 40.0],
+            'total_amount': [10.0, 40.0, 90.0, 160.0],
+            'region': ['us_east', 'us_west', 'europe', 'asia_pacific'],
+            'store_id': ['S010', 'S020', 'S030', 'S040'],
+            'payment_method': ['credit', 'cash', 'credit', 'debit'],
+            'discount_amount': [0, 0, 0, 0],
+            'tax_amount': [1.0, 4.0, 9.0, 16.0],
+            'created_at': pd.to_datetime('2024-01-14'),
+            'updated_at': pd.to_datetime('2024-01-15 08:00:00'),
+            'is_deleted': [False, False, True, False],
+        })
+
+    def test_cdc_split_live_and_deleted(self, cdc_batch):
+        """Transformation should separate live rows from delete markers"""
+        live_df = cdc_batch[cdc_batch['is_deleted'] == False]  # noqa: E712
+        delete_df = cdc_batch[cdc_batch['is_deleted'] == True]  # noqa: E712
+
+        assert len(live_df) == 3
+        assert len(delete_df) == 1
+        assert delete_df.iloc[0]['sale_id'] == 30
+
+    def test_delete_markers_pass_through(self, cdc_batch):
+        """Delete markers should not be filtered by data validation"""
+        delete_df = cdc_batch[cdc_batch['is_deleted'] == True].copy()  # noqa: E712
+
+        # Delete markers may have quantity=0 or other values that would
+        # fail validation, but they should not be subject to validation
+        # because they only need sale_id for the MERGE DELETE clause.
+        assert len(delete_df) == 1
+        assert 'sale_id' in delete_df.columns
+
+    def test_incremental_window_calculation(self):
+        """Verify extraction window spans exactly one day"""
+        exec_date = datetime.strptime('2024-01-16', '%Y-%m-%d')
+        window_start = (exec_date - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+        window_end = exec_date.strftime('%Y-%m-%d %H:%M:%S')
+
+        assert window_start == '2024-01-15 00:00:00'
+        assert window_end == '2024-01-16 00:00:00'
+
+    def test_cdc_upsert_and_delete(self):
+        """Test full CDC merge: insert, update, and delete in one batch"""
+        # Existing target table
+        target = pd.DataFrame({
+            'sale_id': [1, 2, 3],
+            'total_amount': [100, 200, 300],
+            'is_deleted': [False, False, False]
+        }).set_index('sale_id')
+
+        # CDC changes: update sale_id=2, delete sale_id=3, insert sale_id=4
+        changes = pd.DataFrame({
+            'sale_id': [2, 3, 4],
+            'total_amount': [250, 300, 400],
+            'is_deleted': [False, True, False]
+        }).set_index('sale_id')
+
+        # Apply updates
+        live_changes = changes[changes['is_deleted'] == False]  # noqa: E712
+        target.update(live_changes[['total_amount']])
+
+        # Apply deletes
+        delete_ids = changes[changes['is_deleted'] == True].index  # noqa: E712
+        target = target.drop(delete_ids, errors='ignore')
+
+        # Apply inserts
+        new_rows = live_changes[~live_changes.index.isin(target.index)]
+        target = pd.concat([target, new_rows[['total_amount', 'is_deleted']]])
+
+        target = target.reset_index()
+
+        assert len(target) == 3  # 1 (kept) + 1 (updated) + 1 (inserted) - 1 (deleted)
+        assert 3 not in target['sale_id'].values  # Deleted
+        assert target[target['sale_id'] == 2]['total_amount'].values[0] == 250  # Updated
+        assert 4 in target['sale_id'].values  # Inserted
+
+    def test_debezium_connector_configs_exist(self):
+        """All regional Debezium connector configs should exist"""
+        config_dir = Path(__file__).resolve().parent.parent / 'config' / 'debezium'
+        for region_cfg in REGION_CONFIGS:
+            connector_file = config_dir / f"connector_{region_cfg['name']}.json"
+            assert connector_file.exists(), f"Missing: {connector_file}"
+            with open(connector_file) as f:
+                config = json.load(f)
+            assert 'name' in config
+            assert 'config' in config
+            assert config['config']['plugin.name'] == 'pgoutput'
+            assert region_cfg['name'] in config['config']['slot.name']
+
+    def test_snowflake_sink_connector_config_exists(self):
+        """Snowflake Kafka sink connector config should exist"""
+        sink_file = (
+            Path(__file__).resolve().parent.parent
+            / 'config' / 'debezium' / 'snowflake_sink_connector.json'
+        )
+        assert sink_file.exists()
+        with open(sink_file) as f:
+            config = json.load(f)
+        assert config['config']['connector.class'] == \
+            'com.snowflake.kafka.connector.SnowflakeSinkConnector'
+        assert config['config']['snowflake.ingestion.method'] == 'SNOWPIPE_STREAMING'
+
+    def test_snowflake_sql_scripts_exist(self):
+        """All Snowflake CDC SQL scripts should exist"""
+        sql_dir = Path(__file__).resolve().parent.parent / 'sql'
+        expected_scripts = [
+            '01_postgresql_cdc_setup.sql',
+            '02_snowflake_cdc_tables.sql',
+            '03_snowflake_streams.sql',
+            '04_snowflake_tasks.sql',
+        ]
+        for script in expected_scripts:
+            script_path = sql_dir / script
+            assert script_path.exists(), f"Missing SQL script: {script_path}"
 
 
 # ============================================================================

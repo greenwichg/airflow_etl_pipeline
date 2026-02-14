@@ -1,0 +1,27 @@
+{
+  "name": "retail-sales-snowflake-sink",
+  "config": {
+    "connector.class": "com.snowflake.kafka.connector.SnowflakeSinkConnector",
+    "tasks.max": "4",
+    "topics": "cdc.retail.sales.transactions",
+    "snowflake.url.name": "${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com:443",
+    "snowflake.user.name": "${SNOWFLAKE_USER}",
+    "snowflake.private.key": "${SNOWFLAKE_PRIVATE_KEY}",
+    "snowflake.database.name": "RETAIL_DW",
+    "snowflake.schema.name": "STAGING",
+    "snowflake.role.name": "ETL_ROLE",
+    "snowflake.topic2table.map": "cdc.retail.sales.transactions:CDC_SALES_EVENTS",
+    "buffer.count.records": "10000",
+    "buffer.flush.time": "60",
+    "buffer.size.bytes": "5000000",
+    "snowflake.ingestion.method": "SNOWPIPE_STREAMING",
+    "snowflake.enable.schematization": "true",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dlq.snowflake.sink",
+    "errors.deadletterqueue.context.headers.enable": "true"
+  }
+}
