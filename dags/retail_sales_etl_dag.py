@@ -191,7 +191,8 @@ def extract_sales_data_from_region(region: str, conn_id: str, execution_date: st
     return {
         'region': region,
         'record_count': record_count,
-        'target_date': target_date,
+        'window_start': window_start,
+        'window_end': window_end,
         'status': 'success'
     }
 
