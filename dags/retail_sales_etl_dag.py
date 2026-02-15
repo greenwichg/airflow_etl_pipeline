@@ -31,6 +31,7 @@ except ImportError:
     # Provider >=5.0 removed SnowflakeOperator; use the common SQL operator.
     from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator as SnowflakeOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
@@ -991,6 +992,63 @@ with DAG(
     )
 
     # ========================================================================
+    # dbt TRANSFORMATION — Business logic layer
+    # ========================================================================
+    # dbt replaces raw SQL MERGE with modular, tested, documented models:
+    #   staging → intermediate (enrichment + validation) → marts (fct_sales)
+
+    _dbt_project_dir = str(
+        Path(__file__).resolve().parent.parent / 'dbt_retail_sales'
+    )
+    _dbt_base_cmd = (
+        f'cd {_dbt_project_dir} && '
+        f'dbt --profiles-dir {_dbt_project_dir}'
+    )
+
+    with TaskGroup(group_id='dbt_transform') as dbt_transform:
+        dbt_deps = BashOperator(
+            task_id='dbt_deps',
+            bash_command=f'{_dbt_base_cmd} deps',
+            doc_md='### dbt deps\nInstall dbt packages (dbt_utils, dbt_expectations).',
+        )
+
+        dbt_seed = BashOperator(
+            task_id='dbt_seed',
+            bash_command=f'{_dbt_base_cmd} seed',
+            doc_md='### dbt seed\nLoad reference CSV data (payment_methods).',
+        )
+
+        dbt_run = BashOperator(
+            task_id='dbt_run',
+            bash_command=f'{_dbt_base_cmd} run --select tag:daily',
+            doc_md="""
+            ### dbt run
+            Executes all daily dbt models in DAG order:
+            1. **staging** — `stg_sales_transactions`, `stg_cdc_delete_markers`
+            2. **intermediate** — `int_sales_enriched`, `int_sales_validated`
+            3. **marts** — `fct_sales`, `dim_regions`, `dim_stores`, `agg_daily_sales`
+            """,
+        )
+
+        dbt_test = BashOperator(
+            task_id='dbt_test',
+            bash_command=f'{_dbt_base_cmd} test --select tag:daily',
+            doc_md="""
+            ### dbt test
+            Runs schema tests (unique, not_null, accepted_values, expectations)
+            and custom data tests (orphan stores, completeness checks).
+            """,
+        )
+
+        dbt_snapshot = BashOperator(
+            task_id='dbt_snapshot',
+            bash_command=f'{_dbt_base_cmd} snapshot',
+            doc_md='### dbt snapshot\nSCD Type 2 history tracking on fct_sales.',
+        )
+
+        dbt_deps >> dbt_seed >> dbt_run >> dbt_test >> dbt_snapshot
+
+    # ========================================================================
     # SUCCESS PATH
     # ========================================================================
 
@@ -1018,7 +1076,9 @@ with DAG(
     start >> extract_data >> transform_data >> validate_quality
 
     # Branch on validation results
-    validate_quality >> prepare_load >> stage_to_snowflake >> merge_to_final >> verify_load >> success
+    # Success path: load to Snowflake staging, then dbt handles the rest
+    validate_quality >> prepare_load >> stage_to_snowflake >> merge_to_final
+    merge_to_final >> dbt_transform >> verify_load >> success
     validate_quality >> data_quality_failed
 
     # Both branches converge at end

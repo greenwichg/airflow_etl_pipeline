@@ -18,6 +18,7 @@
 
 - [Architecture](#architecture)
 - [CDC Architecture](#cdc-architecture)
+- [dbt Transformation Layer](#dbt-transformation-layer)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
 - [DAG Flow](#dag-flow)
@@ -25,6 +26,7 @@
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [CDC Setup](#cdc-setup)
+- [dbt Usage](#dbt-usage)
 - [Data Quality](#data-quality)
 - [Testing](#testing)
 - [Performance](#performance)
@@ -191,6 +193,74 @@ Tasks run **autonomously** -- no Airflow scheduling needed. They activate only w
 
 ---
 
+## dbt Transformation Layer
+
+All business logic runs through **dbt** (data build tool), replacing raw SQL with modular, tested, documented models:
+
+```mermaid
+graph LR
+    subgraph Staging["Staging (views)"]
+        S1["stg_sales_transactions"]
+        S2["stg_cdc_delete_markers"]
+    end
+
+    subgraph Intermediate["Intermediate (ephemeral)"]
+        I1["int_sales_enriched"]
+        I2["int_sales_validated"]
+    end
+
+    subgraph Marts["Marts (incremental/table)"]
+        F["fct_sales"]
+        D1["dim_regions"]
+        D2["dim_stores"]
+        A["agg_daily_sales"]
+    end
+
+    subgraph Snapshots
+        SN["snap_sales_fact<br/>(SCD Type 2)"]
+    end
+
+    S1 --> I1 --> I2 --> F
+    S2 -.->|post_hook delete| F
+    F --> D1 & D2 & A
+    F --> SN
+
+    style S1 fill:#e3f2fd
+    style S2 fill:#ffcdd2
+    style F fill:#4caf50,color:#fff
+    style SN fill:#fff3e0
+```
+
+### dbt Model Layers
+
+| Layer | Model | Materialization | Purpose |
+|-------|-------|----------------|---------|
+| **Staging** | `stg_sales_transactions` | view | Clean, cast, deduplicate live rows |
+| **Staging** | `stg_cdc_delete_markers` | view | Extract CDC delete markers |
+| **Intermediate** | `int_sales_enriched` | ephemeral | Derived metrics: net_amount, gross_profit, partitions |
+| **Intermediate** | `int_sales_validated` | ephemeral | Business rule validation gate |
+| **Marts** | `fct_sales` | incremental (merge) | CDC-aware fact table with clustering |
+| **Marts** | `dim_regions` | table | Region dimension with aggregated stats |
+| **Marts** | `dim_stores` | table | Store dimension with activity metrics |
+| **Marts** | `agg_daily_sales` | incremental (merge) | Pre-computed daily KPIs by region |
+| **Snapshot** | `snap_sales_fact` | snapshot | SCD Type 2 history of every sale |
+
+### dbt in the Airflow DAG
+
+dbt runs as a **TaskGroup** in the pipeline after Snowflake staging:
+
+```
+extract → transform → validate → stage_to_snowflake → dbt_transform → verify → success
+                                                         |
+                                                         +-- dbt deps
+                                                         +-- dbt seed
+                                                         +-- dbt run --select tag:daily
+                                                         +-- dbt test --select tag:daily
+                                                         +-- dbt snapshot
+```
+
+---
+
 ## Project Structure
 
 ```
@@ -209,6 +279,27 @@ airflow_etl_pipeline/
 |       |-- connector_asia_pacific.json  # Debezium source connector (APAC)
 |       +-- snowflake_sink_connector.json  # Snowpipe Streaming sink connector
 |
+|-- dbt_retail_sales/                    # dbt project root
+|   |-- dbt_project.yml                # Project config & materialization defaults
+|   |-- profiles.yml                   # Snowflake connection profiles (dev/prod)
+|   |-- packages.yml                   # dbt_utils, dbt_expectations
+|   |-- models/
+|   |   |-- staging/                   # Views: clean, cast, deduplicate
+|   |   |   |-- stg_sales_transactions.sql
+|   |   |   +-- stg_cdc_delete_markers.sql
+|   |   |-- intermediate/             # Ephemeral: enrich, validate
+|   |   |   |-- int_sales_enriched.sql
+|   |   |   +-- int_sales_validated.sql
+|   |   +-- marts/                     # Incremental: fact, dims, aggregates
+|   |       |-- fct_sales.sql
+|   |       |-- dim_regions.sql
+|   |       |-- dim_stores.sql
+|   |       +-- agg_daily_sales.sql
+|   |-- macros/                        # Reusable SQL: CDC hooks, converters
+|   |-- tests/                         # Custom data tests
+|   |-- snapshots/                     # SCD Type 2 (snap_sales_fact)
+|   +-- seeds/                         # Reference CSV (payment_methods)
+|
 |-- sql/
 |   |-- 01_postgresql_cdc_setup.sql    # WAL config, replication user, publications
 |   |-- 02_snowflake_cdc_tables.sql    # CDC events, staging, fact, audit tables
@@ -219,11 +310,12 @@ airflow_etl_pipeline/
 |   +-- deploy_connectors.sh           # Deploy all Kafka Connect connectors
 |
 |-- tests/
-|   +-- test_retail_sales_etl.py       # Unit tests: DAG, transforms, quality, CDC
+|   +-- test_retail_sales_etl.py       # Unit tests: DAG, transforms, quality, CDC, dbt
 |
 |-- docs/
 |   |-- architecture_diagrams.md       # Mermaid architecture diagrams
-|   +-- interview_prep.md              # Interview Q&A guide
+|   |-- interview_prep.md              # Interview Q&A guide
+|   +-- dbt_interview_prep.md          # dbt interview prep (50+ questions)
 |
 |-- envs/
 |   +-- env.template                   # Environment variable template
@@ -250,6 +342,7 @@ airflow_etl_pipeline/
 | **Message Bus** | Apache Kafka 7.5 | Durable, ordered CDC event stream |
 | **Schema Mgmt** | Confluent Schema Registry | Avro schema evolution |
 | **Staging DB** | PostgreSQL 12+ | Intermediate transformation storage |
+| **Transformation** | dbt 1.7+ (Snowflake) | Modular SQL models, tests, docs, snapshots |
 | **Processing** | Python / Pandas | Data consolidation, cleaning, enrichment |
 | **Object Storage** | AWS S3 | Staging area for Snowflake COPY |
 | **Data Warehouse** | Snowflake | Streams, Tasks, and final analytics tables |
@@ -519,6 +612,74 @@ ORDER BY SCHEDULED_TIME DESC LIMIT 20;
 
 ---
 
+## dbt Usage
+
+### Setup
+
+```bash
+# Install dbt with Snowflake adapter
+pip install dbt-snowflake>=1.7.0
+
+# Navigate to dbt project
+cd dbt_retail_sales/
+
+# Install packages (dbt_utils, dbt_expectations)
+dbt deps --profiles-dir .
+
+# Verify connection
+dbt debug --profiles-dir .
+```
+
+### Profile Configuration
+
+Update `dbt_retail_sales/profiles.yml` with your Snowflake credentials, or set environment variables:
+
+```bash
+export DBT_SNOWFLAKE_ACCOUNT=my_account
+export DBT_SNOWFLAKE_USER=etl_user
+export DBT_SNOWFLAKE_PASSWORD=...
+export DBT_SNOWFLAKE_DATABASE=retail_analytics
+export DBT_SNOWFLAKE_WAREHOUSE=ETL_WH
+```
+
+### Running Models
+
+```bash
+# Full pipeline: seed → run → test → snapshot
+dbt seed --profiles-dir .            # Load reference data (payment_methods)
+dbt run --profiles-dir .             # Build all models
+dbt test --profiles-dir .            # Run schema + custom tests
+dbt snapshot --profiles-dir .        # Update SCD Type 2 history
+
+# Selective execution (tag-based)
+dbt run --select tag:daily --profiles-dir .
+dbt test --select tag:daily --profiles-dir .
+
+# Run a single model and its downstream dependents
+dbt run --select fct_sales+ --profiles-dir .
+
+# Run all staging models
+dbt run --select staging.* --profiles-dir .
+
+# Generate and serve documentation
+dbt docs generate --profiles-dir .
+dbt docs serve --profiles-dir .
+```
+
+### Airflow Integration
+
+dbt is integrated into the DAG as a `TaskGroup` that runs after Snowflake staging. No manual dbt execution is needed in production -- Airflow handles it automatically:
+
+```
+merge_to_final → [dbt deps → dbt seed → dbt run → dbt test → dbt snapshot] → verify_load
+```
+
+### Interview Preparation
+
+A comprehensive dbt interview guide is available at `docs/dbt_interview_prep.md`, covering 20 topic areas with 80+ questions and answers.
+
+---
+
 ## Data Quality
 
 ### Validation Gates
@@ -579,6 +740,7 @@ pytest tests/test_retail_sales_etl.py::TestDataTransformation -v
 | `TestErrorScenarios` | 2 | Zero records, partial region failure |
 | `TestPerformance` | 1 | Parallel vs sequential extraction benefit |
 | `TestCDCLogic` | 8 | Live/delete split, delete passthrough, timestamp window, CDC upsert+delete, Debezium configs, Snowflake sink config, SQL scripts |
+| `TestDbtProject` | 9 | Project config, model layers, staging/mart models, macros, tests, snapshots, sources, interview guide (20 topics, 80+ Q&A) |
 
 ### CI Pipeline (`.github/workflows/ci.yml`)
 

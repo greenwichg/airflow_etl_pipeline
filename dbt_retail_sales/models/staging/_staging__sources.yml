@@ -1,0 +1,42 @@
+version: 2
+
+sources:
+  - name: raw_cdc
+    description: >
+      Raw CDC events landing table populated by Snowpipe Streaming
+      from the Debezium Kafka pipeline, plus the batch extraction
+      staging table populated by the Airflow DAG.
+    database: RETAIL_DW
+    schema: STAGING
+    freshness:
+      warn_after: {count: 2, period: hour}
+      error_after: {count: 6, period: hour}
+    loaded_at_field: _inserted_at
+    tables:
+      - name: cdc_sales_events
+        description: Raw Debezium JSON envelopes from Kafka
+        columns:
+          - name: record_content
+            description: Full Debezium change event payload (VARIANT)
+          - name: record_metadata
+            description: Kafka topic/partition/offset metadata
+          - name: _kafka_offset
+            description: Kafka consumer offset
+          - name: _inserted_at
+            description: Snowflake ingestion timestamp
+
+      - name: sales_data_stage
+        description: >
+          Parsed and transformed sales records from the batch Airflow
+          pipeline. Includes both live rows and CDC delete markers.
+        columns:
+          - name: sale_id
+            description: Primary key from the source transactional system
+            tests:
+              - not_null
+          - name: is_deleted
+            description: CDC soft-delete flag (TRUE = delete marker)
+          - name: etl_batch_id
+            description: Batch identifier (YYYYMMDD format)
+          - name: _cdc_operation
+            description: "Debezium op code: c=create, u=update, d=delete, r=snapshot"

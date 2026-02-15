@@ -1,0 +1,4 @@
+payment_method,display_name,is_digital
+credit,Credit Card,true
+cash,Cash,false
+debit,Debit Card,true

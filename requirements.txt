@@ -14,5 +14,8 @@ psycopg2-binary>=2.9.0
 # AWS SDK
 boto3>=1.26.0
 
+# dbt (Snowflake adapter includes dbt-core)
+dbt-snowflake>=1.7.0,<2.0.0
+
 # Testing
 pytest>=7.0.0

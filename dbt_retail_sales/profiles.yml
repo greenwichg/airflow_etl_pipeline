@@ -1,0 +1,29 @@
+retail_sales:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '') }}"
+      role: ETL_ROLE
+      database: RETAIL_DW
+      warehouse: ETL_WH
+      schema: ANALYTICS
+      threads: 4
+      client_session_keep_alive: true
+      query_tag: 'dbt_retail_sales'
+
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: ETL_ROLE
+      database: RETAIL_DW
+      warehouse: ETL_WH
+      schema: ANALYTICS
+      threads: 8
+      client_session_keep_alive: true
+      query_tag: 'dbt_retail_sales_prod'

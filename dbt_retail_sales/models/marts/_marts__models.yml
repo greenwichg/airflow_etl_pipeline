@@ -1,0 +1,54 @@
+version: 2
+
+models:
+  - name: fct_sales
+    description: >
+      Incremental fact table containing validated, enriched sales
+      transactions. Uses CDC-aware merge: inserts new rows, updates
+      existing rows, and deletes soft-deleted rows. Clustered by
+      sale_date and region for optimal BI query performance.
+    columns:
+      - name: sale_id
+        description: Primary key
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+      - name: sale_date
+        tests:
+          - not_null
+      - name: region
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC']
+      - name: net_amount
+        tests:
+          - not_null
+      - name: gross_profit
+        tests:
+          - not_null
+
+  - name: dim_regions
+    description: >
+      Region dimension table derived from config and sales data.
+      One row per active region with aggregated metrics.
+
+  - name: dim_stores
+    description: >
+      Store dimension derived from transactional data. Contains
+      one row per unique store_id with its region and last activity.
+
+  - name: agg_daily_sales
+    description: >
+      Daily sales aggregation by region. Pre-computed rollup for
+      dashboard KPIs: revenue, orders, average order value, etc.
+    columns:
+      - name: sale_date
+        tests:
+          - not_null
+      - name: region
+        tests:
+          - not_null
