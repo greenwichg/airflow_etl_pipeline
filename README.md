@@ -676,7 +676,7 @@ merge_to_final → [dbt deps → dbt seed → dbt run → dbt test → dbt snaps
 
 ### Interview Preparation
 
-A comprehensive dbt interview guide is available at `docs/dbt_interview_prep.md`, covering 14 topic areas with 50+ questions and answers.
+A comprehensive dbt interview guide is available at `docs/dbt_interview_prep.md`, covering 20 topic areas with 80+ questions and answers.
 
 ---
 
@@ -740,7 +740,7 @@ pytest tests/test_retail_sales_etl.py::TestDataTransformation -v
 | `TestErrorScenarios` | 2 | Zero records, partial region failure |
 | `TestPerformance` | 1 | Parallel vs sequential extraction benefit |
 | `TestCDCLogic` | 8 | Live/delete split, delete passthrough, timestamp window, CDC upsert+delete, Debezium configs, Snowflake sink config, SQL scripts |
-| `TestDbtProject` | 9 | Project config, model layers, staging/mart models, macros, tests, snapshots, sources, interview guide |
+| `TestDbtProject` | 9 | Project config, model layers, staging/mart models, macros, tests, snapshots, sources, interview guide (20 topics, 80+ Q&A) |
 
 ### CI Pipeline (`.github/workflows/ci.yml`)
 

@@ -20,6 +20,12 @@ Comprehensive Q&A guide for dbt (data build tool) interviews, covering fundament
 12. [dbt with CDC](#12-dbt-with-cdc)
 13. [Performance & Best Practices](#13-performance--best-practices)
 14. [Advanced Scenarios](#14-advanced-scenarios)
+15. [Exposures & Documentation](#15-exposures--documentation)
+16. [Semantic Layer & Metrics](#16-semantic-layer--metrics)
+17. [Contracts & Model Governance](#17-contracts--model-governance)
+18. [dbt Cloud & CI/CD](#18-dbt-cloud--cicd)
+19. [Variables & Custom Generic Tests](#19-variables--custom-generic-tests)
+20. [dbt Mesh & Multi-Project](#20-dbt-mesh--multi-project)
 
 ---
 
@@ -542,6 +548,516 @@ Each developer gets their own schema (`DEV_<username>_ANALYTICS`) via `generate_
 {{ dbt_utils.generate_surrogate_key(['store_id']) }} as store_key
 ```
 Use for dimension tables where the natural key is a string (varchar) and you want a compact, consistent surrogate key for joins.
+
+---
+
+## 15. Exposures & Documentation
+
+### Q: What are exposures in dbt?
+
+**A:** Exposures define **downstream consumers** of your dbt models — dashboards, ML models, applications, or reports. They create lineage visibility from source → model → end use:
+
+```yaml
+# models/exposures.yml
+exposures:
+  - name: daily_sales_dashboard
+    type: dashboard
+    owner:
+      name: Analytics Team
+      email: analytics@company.com
+    depends_on:
+      - ref('agg_daily_sales')
+      - ref('dim_regions')
+    url: https://bi-tool.company.com/dashboards/daily-sales
+    description: >
+      Executive dashboard showing daily revenue by region.
+      Used by C-suite for daily stand-ups.
+    maturity: high
+```
+
+**Benefits:**
+- `dbt run -s +exposure:daily_sales_dashboard` rebuilds only models needed for that dashboard
+- Shows impact analysis — if you change `agg_daily_sales`, you know which dashboards break
+- Appears in the dbt docs lineage graph
+
+### Q: How does dbt documentation work?
+
+**A:** dbt generates a **static documentation site** from three sources:
+
+**1. YAML descriptions:**
+```yaml
+models:
+  - name: fct_sales
+    description: "Fact table containing all completed sales transactions"
+    columns:
+      - name: sale_id
+        description: "Primary key - unique sale identifier"
+```
+
+**2. Doc blocks (reusable documentation):**
+```sql
+-- models/docs.md
+{% docs sale_id %}
+Unique identifier for each sales transaction, assigned by the
+regional POS system. Format: `REGION-YYYYMMDD-NNNNN`.
+{% enddocs %}
+
+-- Reference in YAML:
+columns:
+  - name: sale_id
+    description: '{{ doc("sale_id") }}'
+```
+
+**3. Auto-generated:**
+- Column types, tests, and relationships from the warehouse catalog
+- DAG lineage graph
+- Source freshness results
+
+```bash
+dbt docs generate    # Creates catalog.json + manifest.json
+dbt docs serve       # Serves at localhost:8080
+```
+
+### Q: What are dbt artifacts and how are they used?
+
+**A:** dbt produces JSON artifacts after each run:
+
+| Artifact | Contains | Use case |
+|----------|----------|----------|
+| `manifest.json` | Full project DAG, model SQL, configs | Slim CI (state comparison), external tooling |
+| `run_results.json` | Status, timing, row counts per model | Monitoring dashboards, alerting |
+| `catalog.json` | Column types, stats from warehouse | Documentation site |
+| `sources.json` | Source freshness check results | Freshness monitoring |
+
+These artifacts power advanced workflows like **Slim CI** and integration with monitoring tools.
+
+---
+
+## 16. Semantic Layer & Metrics
+
+### Q: What is the dbt Semantic Layer?
+
+**A:** The dbt Semantic Layer (powered by **MetricFlow**) lets you define metrics **once** in YAML and query them from any BI tool, API, or notebook — ensuring consistent definitions across the organization.
+
+```yaml
+# models/metrics/revenue.yml
+semantic_models:
+  - name: sales
+    defaults:
+      agg_time_dimension: sale_date
+    model: ref('fct_sales')
+    entities:
+      - name: sale
+        type: primary
+        expr: sale_id
+      - name: store
+        type: foreign
+        expr: store_id
+    dimensions:
+      - name: region
+        type: categorical
+      - name: sale_date
+        type: time
+        type_params:
+          time_granularity: day
+    measures:
+      - name: total_revenue
+        agg: sum
+        expr: net_amount
+      - name: order_count
+        agg: count
+        expr: sale_id
+
+metrics:
+  - name: revenue
+    type: simple
+    label: "Total Revenue"
+    type_params:
+      measure: total_revenue
+
+  - name: average_order_value
+    type: derived
+    label: "Average Order Value (AOV)"
+    type_params:
+      expr: total_revenue / order_count
+      metrics:
+        - name: total_revenue
+        - name: order_count
+```
+
+### Q: What types of metrics does MetricFlow support?
+
+**A:**
+
+| Type | Description | Example |
+|------|------------|---------|
+| **simple** | Wraps a single measure | `SUM(revenue)` |
+| **derived** | Combines other metrics with arithmetic | `revenue / order_count` |
+| **cumulative** | Running total over a time window | `SUM(revenue) OVER 28 days` |
+| **conversion** | Funnel/conversion rate between events | `purchases / visits` |
+
+### Q: Why use the Semantic Layer instead of defining metrics in BI tools?
+
+**A:**
+1. **Single source of truth** — metric definitions live in version-controlled YAML, not scattered across Looker, Tableau, and spreadsheets
+2. **Consistent results** — every consumer sees the same `revenue` number
+3. **Governed** — changes go through PR review, not ad-hoc BI edits
+4. **Composable** — derived metrics reference other metrics, preventing copy-paste drift
+
+---
+
+## 17. Contracts & Model Governance
+
+### Q: What are dbt model contracts?
+
+**A:** Contracts enforce a **guaranteed interface** for a model — column names, data types, and constraints. If the model output doesn't match the contract, dbt fails the run.
+
+```yaml
+models:
+  - name: fct_sales
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: sale_id
+        data_type: number(38,0)
+        constraints:
+          - type: not_null
+          - type: primary_key
+      - name: net_amount
+        data_type: number(18,2)
+        constraints:
+          - type: not_null
+      - name: sale_date
+        data_type: date
+        constraints:
+          - type: not_null
+```
+
+**Why use contracts:**
+- Prevent breaking downstream consumers (BI dashboards, ML pipelines)
+- Catch schema drift early (in CI, not production)
+- Enforce data types at the warehouse level (not just naming conventions)
+
+### Q: What are dbt groups and access modifiers?
+
+**A:** Groups partition models by **team ownership**. Access modifiers control which models can be referenced across group boundaries:
+
+```yaml
+# dbt_project.yml
+groups:
+  - name: sales_team
+    owner:
+      name: Sales Analytics
+      email: sales-data@company.com
+
+# Model config:
+models:
+  - name: fct_sales
+    config:
+      group: sales_team
+      access: public       # Anyone can ref() this model
+  - name: int_sales_validated
+    config:
+      group: sales_team
+      access: protected    # Only models in sales_team can ref()
+  - name: stg_sales_transactions
+    config:
+      group: sales_team
+      access: private      # Only models in this group and directory can ref()
+```
+
+| Access level | Who can `ref()` it | Analogy |
+|-------------|-------------------|---------|
+| **public** | Any model in any group or project | Public API |
+| **protected** | Models in the same group | Internal package function |
+| **private** | Models in the same group AND directory | Private method |
+
+### Q: What are model versions in dbt?
+
+**A:** Model versioning supports **non-breaking migrations** when you need to change a public model's contract:
+
+```yaml
+models:
+  - name: fct_sales
+    latest_version: 2
+    versions:
+      - v: 1
+        columns:
+          - name: total_amount
+            data_type: number(18,2)
+      - v: 2
+        columns:
+          - include: all
+          - name: net_amount        # New column added in v2
+            data_type: number(18,2)
+```
+
+Consumers reference a specific version: `{{ ref('fct_sales', v=1) }}`. This lets you evolve models without breaking existing dashboards.
+
+---
+
+## 18. dbt Cloud & CI/CD
+
+### Q: What is Slim CI in dbt?
+
+**A:** Slim CI uses **state comparison** to only build and test models that have changed (or whose upstream dependencies changed), dramatically reducing CI run times:
+
+```bash
+# Compare against production state (manifest.json from last prod run)
+dbt run -s state:modified+        # Modified models + downstream
+dbt test -s state:modified+       # Tests for modified models only
+```
+
+**How it works:**
+1. Production run saves `manifest.json` as an artifact
+2. CI pipeline downloads that artifact
+3. `state:modified` compares current code against the production manifest
+4. Only changed models (and their downstream dependents) are built
+
+```yaml
+# GitHub Actions CI example:
+- name: Download production manifest
+  run: |
+    aws s3 cp s3://dbt-artifacts/prod/manifest.json ./target/prod_manifest.json
+
+- name: Run modified models only
+  run: |
+    dbt run -s state:modified+ --defer --state ./target/prod_manifest.json
+```
+
+### Q: What does `--defer` do?
+
+**A:** `--defer` tells dbt to use **production tables** for any upstream model that isn't being rebuilt in the current run. Without `--defer`, Slim CI would fail when a modified model references an unmodified upstream model that doesn't exist in the CI schema.
+
+```bash
+# Without --defer: fails if stg_sales_transactions doesn't exist in CI schema
+dbt run -s fct_sales --state ./prod_state/
+
+# With --defer: uses production stg_sales_transactions as input
+dbt run -s fct_sales --defer --state ./prod_state/
+```
+
+### Q: What are the differences between dbt Core and dbt Cloud?
+
+**A:**
+
+| Feature | dbt Core (OSS) | dbt Cloud |
+|---------|----------------|-----------|
+| **Execution** | CLI / Airflow | Managed scheduler + IDE |
+| **CI/CD** | DIY (GitHub Actions) | Built-in CI on PR |
+| **Documentation** | Self-hosted static site | Hosted docs with search |
+| **Semantic Layer** | MetricFlow CLI only | API + BI integrations |
+| **Environment mgmt** | profiles.yml targets | UI-based environments |
+| **State management** | Manual artifact storage | Automatic artifact storage |
+| **Cost** | Free | Paid (per developer seat) |
+
+### Q: How do you implement dbt CI/CD with GitHub Actions?
+
+**A:**
+```yaml
+name: dbt CI
+on:
+  pull_request:
+    paths:
+      - 'dbt_retail_sales/**'
+
+jobs:
+  dbt-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: Install packages
+        run: dbt deps --profiles-dir .
+
+      - name: Compile (syntax check)
+        run: dbt compile --profiles-dir .
+
+      - name: Run modified models (Slim CI)
+        run: |
+          dbt run -s state:modified+ \
+            --defer --state ./prod_artifacts/ \
+            --target ci --profiles-dir .
+
+      - name: Test modified models
+        run: |
+          dbt test -s state:modified+ \
+            --defer --state ./prod_artifacts/ \
+            --target ci --profiles-dir .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-artifacts
+          path: target/
+```
+
+---
+
+## 19. Variables & Custom Generic Tests
+
+### Q: How do dbt variables work?
+
+**A:** Variables let you parameterize models at runtime using `{{ var() }}`:
+
+**Define defaults in `dbt_project.yml`:**
+```yaml
+vars:
+  min_record_count: 100
+  lookback_days: 3
+  target_regions: ['US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC']
+```
+
+**Use in models:**
+```sql
+select *
+from {{ ref('stg_sales_transactions') }}
+where region in (
+    {% for r in var('target_regions') %}
+        '{{ r }}'{% if not loop.last %},{% endif %}
+    {% endfor %}
+)
+```
+
+**Override at runtime:**
+```bash
+dbt run --vars '{"min_record_count": 50, "lookback_days": 7}'
+```
+
+### Q: What is the difference between singular and generic tests?
+
+**A:**
+
+| | Singular tests | Generic tests |
+|---|---|---|
+| **Location** | `/tests/` directory | `/macros/` or `/tests/generic/` |
+| **Reusability** | One-off, specific to a table | Parameterized, reusable across models |
+| **Declaration** | SQL file returns failing rows | YAML config on columns |
+| **Examples** | `assert_no_orphan_stores.sql` | `unique`, `not_null`, `accepted_values` |
+
+### Q: How do you write a custom generic test?
+
+**A:** Create a macro that accepts `model` and `column_name` parameters:
+
+```sql
+-- tests/generic/test_positive_value.sql
+{% test positive_value(model, column_name) %}
+
+select {{ column_name }}
+from {{ model }}
+where {{ column_name }} < 0
+
+{% endtest %}
+```
+
+**Use in YAML:**
+```yaml
+columns:
+  - name: net_amount
+    tests:
+      - positive_value      # Uses the custom generic test
+      - not_null
+```
+
+### Q: How do you write a custom generic test with additional parameters?
+
+**A:**
+```sql
+-- tests/generic/test_value_in_range.sql
+{% test value_in_range(model, column_name, min_val, max_val) %}
+
+select {{ column_name }}
+from {{ model }}
+where {{ column_name }} < {{ min_val }}
+   or {{ column_name }} > {{ max_val }}
+
+{% endtest %}
+```
+
+**YAML usage:**
+```yaml
+columns:
+  - name: quantity
+    tests:
+      - value_in_range:
+          min_val: 1
+          max_val: 10000
+```
+
+### Q: What is `generate_schema_name` and why would you override it?
+
+**A:** dbt calls `generate_schema_name` to determine the target schema for each model. The default appends `custom_schema` to your profile schema:
+
+| Profile schema | Custom schema | Default result |
+|---------------|--------------|----------------|
+| `DEV_ANALYTICS` | `staging` | `DEV_ANALYTICS_staging` |
+| `ANALYTICS` | `staging` | `ANALYTICS_staging` |
+
+**Common override** — use the custom schema directly in prod, but prefix in dev:
+```sql
+-- macros/generate_schema_name.sql
+{% macro generate_schema_name(custom_schema_name, node) %}
+    {% if target.name == 'prod' %}
+        {{ custom_schema_name | trim }}
+    {% else %}
+        {{ default__generate_schema_name(custom_schema_name, node) }}
+    {% endif %}
+{% endmacro %}
+```
+
+---
+
+## 20. dbt Mesh & Multi-Project
+
+### Q: What is dbt Mesh?
+
+**A:** dbt Mesh is an architecture pattern for **multi-project dbt** environments, where each team owns its own dbt project and exposes public models for cross-project references:
+
+```
+Team A: dbt_sales           Team B: dbt_marketing
+├── fct_sales (public)      ├── fct_campaigns (public)
+├── dim_stores (public)     └── Uses: {{ ref('dbt_sales', 'fct_sales') }}
+└── int_sales (private)
+```
+
+**Key concepts:**
+1. **Cross-project refs** — `{{ ref('project_name', 'model_name') }}` references models from another project
+2. **Access control** — only `public` models can be referenced cross-project
+3. **Contracts** — public models must have enforced contracts (guaranteed schema)
+4. **Independent deployments** — each project has its own CI/CD, schedules, and ownership
+
+### Q: When should you use dbt Mesh vs a monorepo?
+
+**A:**
+
+| Criteria | Monorepo (single project) | dbt Mesh (multi-project) |
+|----------|--------------------------|--------------------------|
+| **Team size** | < 10 analytics engineers | 10+ across multiple domains |
+| **Domain complexity** | Single domain (e.g., sales) | Multiple domains (sales, marketing, finance) |
+| **Deploy frequency** | Team-wide releases | Independent team releases |
+| **Model count** | < 500 models | 500+ models |
+| **Governance** | Informal conventions | Formal contracts + access control |
+
+### Q: How do cross-project references work technically?
+
+**A:**
+1. **Producer** project declares models as `access: public` with enforced contracts
+2. **Producer** publishes its `manifest.json` to a shared location (S3, dbt Cloud)
+3. **Consumer** project declares the dependency:
+   ```yaml
+   # packages.yml (consumer project)
+   projects:
+     - name: dbt_sales
+       # dbt Cloud handles resolution automatically
+       # For Core: provide the manifest location
+   ```
+4. **Consumer** uses cross-project ref:
+   ```sql
+   select * from {{ ref('dbt_sales', 'fct_sales') }}
+   ```
 
 ---
 
