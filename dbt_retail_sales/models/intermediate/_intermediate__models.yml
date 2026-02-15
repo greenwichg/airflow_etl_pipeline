@@ -1,14 +1,47 @@
+# ==============================================================================
+# _intermediate__models.yml — Schema definitions for intermediate models.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   Documents the intermediate models — their purpose and column descriptions.
+#   Since intermediate models are ephemeral (no database objects), they can't
+#   be tested with schema tests directly. But documenting them here:
+#   1. Makes them appear in the dbt docs site (dbt docs generate)
+#   2. Explains the business logic for team members
+#   3. Shows the transformation pipeline in the lineage graph
+#
+# LEARNING TIP:
+#   Even though ephemeral models don't create tables, you should still
+#   document them in YAML. Good documentation is crucial for team knowledge
+#   sharing and onboarding new engineers.
+# ==============================================================================
+
 version: 2
 
 models:
+
+  # ---------------------------------------------------------------------------
+  # int_sales_enriched — Derived metrics and business calculations
+  # ---------------------------------------------------------------------------
+  # This model adds columns that don't exist in the raw data:
+  #   - net_amount (total - discount)
+  #   - gross_profit (net - tax)
+  #   - Partition columns (year, month, day)
+  #   - Amount validity flag (sanity check)
   - name: int_sales_enriched
     description: >
       Sales transactions enriched with derived business metrics:
       net_amount, gross_profit, partition columns, and amount
-      sanity flags. This is an ephemeral model (compiled inline).
+      sanity flags. This is an ephemeral model (compiled inline
+      as a CTE — no table or view is created in the database).
 
+  # ---------------------------------------------------------------------------
+  # int_sales_validated — Data quality gate
+  # ---------------------------------------------------------------------------
+  # This model filters out invalid records, ensuring only clean data
+  # reaches the fact table. Failed records are excluded silently.
   - name: int_sales_validated
     description: >
       Sales records that pass all data quality business rules.
       Records failing validation are logged but excluded from
-      the downstream fact table.
+      the downstream fact table. Also ephemeral (inline CTE).

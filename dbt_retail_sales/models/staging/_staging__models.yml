@@ -1,57 +1,121 @@
+# ==============================================================================
+# _staging__models.yml — Schema tests for staging models.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   This YAML file declares DATA TESTS for the staging models. When you run
+#   `dbt test`, dbt generates SQL queries from these declarations and checks
+#   that the data meets the specified constraints.
+#
+# KEY CONCEPTS — dbt Schema Tests:
+#   - unique:           No duplicate values in this column
+#   - not_null:         No NULL values allowed
+#   - accepted_values:  Column values must be from a specific list
+#   - relationships:    Foreign key integrity (value exists in another model)
+#   - Custom tests:     From packages like dbt_expectations (see below)
+#
+# HOW TESTS WORK:
+#   Each test generates a SELECT query. If the query returns ANY rows,
+#   the test FAILS. For example, `unique` generates:
+#     SELECT sale_id, COUNT(*) FROM model GROUP BY sale_id HAVING COUNT(*) > 1
+#   If any sale_id appears twice → test fails.
+#
+# TEST SEVERITY:
+#   Tests can be configured with severity: warn (log but don't fail) or
+#   severity: error (fail the pipeline). Default is error.
+#
+# FILE NAMING CONVENTION:
+#   - Prefix with underscore (_) so it sorts to the top
+#   - Pattern: _<layer>__models.yml
+#
+# LEARNING TIP:
+#   Schema tests are the backbone of dbt data quality. They run AFTER models
+#   are built, catching issues before data reaches dashboards. Think of them
+#   like unit tests for your data.
+# ==============================================================================
+
 version: 2
 
 models:
+
+  # ---------------------------------------------------------------------------
+  # stg_sales_transactions — Cleaned, deduplicated live sales records
+  # ---------------------------------------------------------------------------
   - name: stg_sales_transactions
     description: >
       Cleaned and deduplicated sales transactions from the staging table.
       Filters out delete markers (handled separately in the incremental merge)
       and applies type casting, null defaults, and column renaming.
     columns:
+
+      # Primary key — must be unique and never null
       - name: sale_id
         description: Unique transaction identifier
         tests:
-          - unique
-          - not_null
+          - unique           # Ensures deduplication logic worked correctly
+          - not_null         # Every record must have an ID
+
+      # Foreign keys — must exist (not_null ensures no orphan records)
       - name: customer_id
         tests:
           - not_null
       - name: product_id
         tests:
           - not_null
+
+      # Business-critical timestamp — used for partitioning and filtering
       - name: sale_date
         tests:
           - not_null
+
+      # Numeric measures — validated with range checks from dbt_expectations
+      # The dbt_expectations package provides Great Expectations-style tests:
+      #   expect_column_values_to_be_between checks min/max boundaries
       - name: quantity
         tests:
           - not_null
           - dbt_expectations.expect_column_values_to_be_between:
-              min_value: 1
+              min_value: 1      # Quantity must be at least 1 (no zero/negative orders)
       - name: unit_price
         tests:
           - not_null
           - dbt_expectations.expect_column_values_to_be_between:
-              min_value: 0.01
+              min_value: 0.01   # Price must be positive (at least 1 cent)
       - name: total_amount
         tests:
           - not_null
           - dbt_expectations.expect_column_values_to_be_between:
-              min_value: 0.01
+              min_value: 0.01   # Total must be positive
+
+      # Categorical dimension — only these 4 regions are valid
+      # accepted_values test generates:
+      #   SELECT region FROM model WHERE region NOT IN ('US-EAST', 'US-WEST', ...)
       - name: region
         tests:
           - not_null
           - accepted_values:
               values: ['US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC']
+
+      # CDC flag — critical for pipeline correctness
       - name: is_deleted
-        description: CDC delete marker flag
+        description: >
+          CDC delete marker flag. In this model it's always FALSE
+          (delete markers are split into stg_cdc_delete_markers).
+          We still test not_null to ensure the flag is always present.
         tests:
           - not_null
 
+  # ---------------------------------------------------------------------------
+  # stg_cdc_delete_markers — Sale IDs flagged for deletion
+  # ---------------------------------------------------------------------------
   - name: stg_cdc_delete_markers
     description: >
       Sale IDs marked for deletion via CDC soft-delete. Used by
       the incremental mart model to remove rows from the fact table.
     columns:
       - name: sale_id
-        description: Transaction to delete from the target
+        description: >
+          Transaction ID to delete from the target fact table.
+          The fct_sales model's post_hook uses this to DELETE matching rows.
         tests:
           - not_null

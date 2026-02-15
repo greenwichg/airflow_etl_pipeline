@@ -1,6 +1,42 @@
+# ==============================================================================
+# _staging__sources.yml — Source definitions for the staging layer.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   Sources define the RAW tables that exist OUTSIDE of dbt (i.e., tables loaded
+#   by Airflow, Debezium, Fivetran, etc.). dbt doesn't create these tables —
+#   it just reads from them.
+#
+# WHY USE source() INSTEAD OF HARDCODING TABLE NAMES?
+#   1. Freshness monitoring: dbt can check if source data is stale
+#   2. Single point of change: rename a table in ONE place, not every model
+#   3. Documentation: sources appear in the dbt docs lineage graph
+#   4. Lineage: shows the full path from raw table → staging → marts
+#
+# HOW TO REFERENCE A SOURCE IN A MODEL:
+#   {{ source('raw_cdc', 'sales_data_stage') }}
+#   This resolves to: RETAIL_DW.STAGING.SALES_DATA_STAGE
+#
+# FILE NAMING CONVENTION:
+#   - Prefix with underscore (_) so it sorts to the top of the directory
+#   - Pattern: _<layer>__sources.yml
+#
+# LEARNING TIP:
+#   Think of source() like an import statement in Python. It tells dbt
+#   "this raw table exists, here's what it looks like, and I want to
+#   track its freshness."
+# ==============================================================================
+
 version: 2
 
 sources:
+
+  # ---------------------------------------------------------------------------
+  # raw_cdc — Raw CDC events and batch-loaded staging data
+  # ---------------------------------------------------------------------------
+  # This source encompasses both:
+  #   1. Real-time CDC events from Debezium → Kafka → Snowpipe
+  #   2. Batch-loaded data from the Airflow ETL pipeline
   - name: raw_cdc
     description: >
       Raw CDC events landing table populated by Snowpipe Streaming
@@ -8,23 +44,56 @@ sources:
       staging table populated by the Airflow DAG.
     database: RETAIL_DW
     schema: STAGING
+
+    # =========================================================================
+    # SOURCE FRESHNESS — Monitors whether data is arriving on schedule.
+    # =========================================================================
+    #
+    # HOW IT WORKS:
+    #   dbt queries: SELECT MAX(_inserted_at) FROM the source table
+    #   If the most recent row is older than warn/error thresholds → alert!
+    #
+    # RUN WITH:
+    #   dbt source freshness
+    #
+    # LEARNING TIP:
+    #   This is critical for data pipelines. If Debezium goes down or Airflow
+    #   DAGs fail silently, source freshness catches it before your dashboards
+    #   show stale data.
     freshness:
-      warn_after: {count: 2, period: hour}
-      error_after: {count: 6, period: hour}
-    loaded_at_field: _inserted_at
+      warn_after: {count: 2, period: hour}    # Warning if no new data for 2 hours
+      error_after: {count: 6, period: hour}   # Error if no new data for 6 hours
+    loaded_at_field: _inserted_at             # Column used to check freshness
+                                              # (when was the row inserted into Snowflake?)
+
     tables:
+
+      # -----------------------------------------------------------------------
+      # Table 1: cdc_sales_events — Raw Debezium JSON from Kafka
+      # -----------------------------------------------------------------------
+      # These are the raw Debezium change events ingested by Snowpipe Streaming.
+      # Each row contains the full Debezium JSON envelope (before/after/op/ts_ms).
+      # Snowflake Streams + Tasks parse these into sales_data_stage.
       - name: cdc_sales_events
         description: Raw Debezium JSON envelopes from Kafka
         columns:
           - name: record_content
-            description: Full Debezium change event payload (VARIANT)
+            description: Full Debezium change event payload (VARIANT — Snowflake's JSON type)
           - name: record_metadata
             description: Kafka topic/partition/offset metadata
           - name: _kafka_offset
-            description: Kafka consumer offset
+            description: Kafka consumer offset (for deduplication and replay)
           - name: _inserted_at
-            description: Snowflake ingestion timestamp
+            description: Snowflake ingestion timestamp (set by Snowpipe)
 
+      # -----------------------------------------------------------------------
+      # Table 2: sales_data_stage — Parsed sales records from batch pipeline
+      # -----------------------------------------------------------------------
+      # This is the table where the Airflow DAG loads cleaned, transformed
+      # records. It contains BOTH live rows and CDC delete markers.
+      # The staging models split these into two separate outputs:
+      #   - stg_sales_transactions: live rows only (is_deleted = false)
+      #   - stg_cdc_delete_markers: delete markers only (is_deleted = true)
       - name: sales_data_stage
         description: >
           Parsed and transformed sales records from the batch Airflow
@@ -33,10 +102,21 @@ sources:
           - name: sale_id
             description: Primary key from the source transactional system
             tests:
-              - not_null
+              - not_null       # Schema test: this column must never be NULL
           - name: is_deleted
-            description: CDC soft-delete flag (TRUE = delete marker)
+            description: >
+              CDC soft-delete flag. TRUE means the source system deleted
+              this transaction. The pipeline propagates this as a DELETE
+              in the Snowflake MERGE.
           - name: etl_batch_id
-            description: Batch identifier (YYYYMMDD format)
+            description: >
+              Batch identifier in YYYYMMDD format. Used to track which
+              Airflow run loaded each record. Enables batch-level rollback:
+              DELETE FROM table WHERE etl_batch_id = '20240115'
           - name: _cdc_operation
-            description: "Debezium op code: c=create, u=update, d=delete, r=snapshot"
+            description: >
+              Debezium operation code indicating what happened in the source DB:
+                c = create (INSERT)
+                u = update (UPDATE)
+                d = delete (DELETE)
+                r = read/snapshot (initial full load)
