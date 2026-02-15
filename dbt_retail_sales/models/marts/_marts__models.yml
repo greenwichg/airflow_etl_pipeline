@@ -1,6 +1,32 @@
+# ==============================================================================
+# _marts__models.yml — Schema tests for mart models.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   Declares data quality tests for the final output tables (marts).
+#   These tests run AFTER models are built, catching issues before
+#   data reaches BI dashboards and end users.
+#
+# WHY TEST MARTS?
+#   Marts are the "public API" of your data warehouse. If a fact table
+#   has duplicates or a dimension is missing entries, every dashboard
+#   built on it will show wrong numbers. Testing marts is the last
+#   line of defense.
+#
+# LEARNING TIP:
+#   The tests here complement (not replace) the staging tests:
+#   - Staging tests: catch source data issues (null IDs, invalid values)
+#   - Mart tests: catch transformation issues (broken joins, lost rows)
+# ==============================================================================
+
 version: 2
 
 models:
+
+  # ---------------------------------------------------------------------------
+  # fct_sales — The main fact table (incremental)
+  # ---------------------------------------------------------------------------
+  # Most heavily tested model because it's the foundation for all analytics.
   - name: fct_sales
     description: >
       Incremental fact table containing validated, enriched sales
@@ -8,22 +34,26 @@ models:
       existing rows, and deletes soft-deleted rows. Clustered by
       sale_date and region for optimal BI query performance.
     columns:
+      # Primary key: must be unique and not null in the fact table
       - name: sale_id
         description: Primary key
         tests:
-          - unique
+          - unique           # If this fails, deduplication logic is broken
           - not_null
+      # Foreign keys: ensure we can join to dimensions
       - name: customer_id
         tests:
           - not_null
       - name: sale_date
         tests:
           - not_null
+      # Dimension: validate region values in the fact table too
       - name: region
         tests:
           - not_null
           - accepted_values:
               values: ['US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC']
+      # Derived measures: ensure enrichment logic didn't produce nulls
       - name: net_amount
         tests:
           - not_null
@@ -31,16 +61,26 @@ models:
         tests:
           - not_null
 
+  # ---------------------------------------------------------------------------
+  # dim_regions — Region dimension table
+  # ---------------------------------------------------------------------------
   - name: dim_regions
     description: >
       Region dimension table derived from config and sales data.
       One row per active region with aggregated metrics.
 
+  # ---------------------------------------------------------------------------
+  # dim_stores — Store dimension table
+  # ---------------------------------------------------------------------------
   - name: dim_stores
     description: >
       Store dimension derived from transactional data. Contains
       one row per unique store_id with its region and last activity.
 
+  # ---------------------------------------------------------------------------
+  # agg_daily_sales — Pre-computed daily KPIs by region
+  # ---------------------------------------------------------------------------
+  # Tested to ensure no missing dates (completeness check).
   - name: agg_daily_sales
     description: >
       Daily sales aggregation by region. Pre-computed rollup for
@@ -48,7 +88,7 @@ models:
     columns:
       - name: sale_date
         tests:
-          - not_null
+          - not_null         # Every aggregation row must have a date
       - name: region
         tests:
-          - not_null
+          - not_null         # Every aggregation row must have a region

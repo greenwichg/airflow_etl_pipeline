@@ -1,29 +1,87 @@
-retail_sales:
-  target: dev
-  outputs:
-    dev:
-      type: snowflake
-      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
-      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '') }}"
-      role: ETL_ROLE
-      database: RETAIL_DW
-      warehouse: ETL_WH
-      schema: ANALYTICS
-      threads: 4
-      client_session_keep_alive: true
-      query_tag: 'dbt_retail_sales'
+# ==============================================================================
+# profiles.yml — Database connection configuration for dbt.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   profiles.yml tells dbt HOW to connect to your data warehouse. It defines
+#   one or more "targets" (environments) like dev and prod, each with its
+#   own credentials, warehouse, and schema.
+#
+# KEY CONCEPTS:
+#   - The top-level key (retail_sales) MUST match `profile:` in dbt_project.yml
+#   - `target:` sets the DEFAULT environment (used when you run `dbt run`)
+#   - Override at runtime: `dbt run --target prod`
+#   - Each target defines a complete connection (type, account, credentials, etc.)
+#
+# SECURITY NOTE:
+#   - NEVER commit real passwords or private keys to Git!
+#   - Use env_var() to read credentials from environment variables.
+#   - In production, use key-pair auth (private_key_path) instead of passwords.
+#   - This file is typically in .gitignore (but we include it as a template).
+#
+# LEARNING TIP:
+#   Think of targets like Node.js environments (development, staging, production).
+#   Each target can point to a different schema, warehouse size, or even a
+#   completely different Snowflake account.
+# ==============================================================================
 
+retail_sales:
+
+  # Default target — `dbt run` uses this target unless you specify --target
+  target: dev
+
+  # Each key under "outputs" is a named target (environment).
+  outputs:
+
+    # =========================================================================
+    # DEV target — for local development and testing
+    # =========================================================================
+    dev:
+      type: snowflake             # Database adapter (snowflake, bigquery, redshift, etc.)
+
+      # --- Connection settings ---
+      # env_var() reads from environment variables at runtime.
+      # The second argument is a default value if the env var is not set.
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"         # e.g., "xy12345.us-east-1"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"               # e.g., "dbt_developer"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"    # Empty string = skip password auth
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '') }}"  # Preferred over password
+
+      # --- Snowflake-specific settings ---
+      role: ETL_ROLE              # Snowflake role for access control (RBAC)
+      database: RETAIL_DW         # Target database
+      warehouse: ETL_WH           # Compute warehouse (controls query speed and cost)
+      schema: ANALYTICS           # Default schema (models can override with +schema)
+
+      # --- Performance settings ---
+      threads: 4                  # How many models to build in parallel
+                                  # Higher = faster, but more warehouse load
+                                  # Dev: 4, Prod: 8 (match your warehouse size)
+
+      # --- Session settings ---
+      client_session_keep_alive: true   # Prevent connection timeouts during long runs
+      query_tag: 'dbt_retail_sales'     # Tag all queries in Snowflake query history
+                                        # Useful for monitoring: find all dbt queries easily
+
+    # =========================================================================
+    # PROD target — for production runs (via Airflow or CI/CD)
+    # =========================================================================
     prod:
       type: snowflake
       account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
       user: "{{ env_var('SNOWFLAKE_USER') }}"
+
+      # Production uses key-pair auth only (no password fallback).
+      # This is more secure: the private key never leaves the server.
       private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+
       role: ETL_ROLE
       database: RETAIL_DW
       warehouse: ETL_WH
       schema: ANALYTICS
+
+      # Production uses more threads for faster execution.
       threads: 8
+
       client_session_keep_alive: true
-      query_tag: 'dbt_retail_sales_prod'
+      query_tag: 'dbt_retail_sales_prod'  # Different tag to separate dev vs prod queries

@@ -1,5 +1,58 @@
+# ==============================================================================
+# packages.yml — External dbt package dependencies.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   packages.yml declares third-party dbt packages your project depends on.
+#   These are installed by running `dbt deps`, which downloads them into
+#   the `dbt_packages/` directory (similar to npm install → node_modules).
+#
+# KEY CONCEPTS:
+#   - Packages provide reusable macros, tests, and models.
+#   - Version ranges use semantic versioning (>=min, <max).
+#   - Always run `dbt deps` before `dbt run` in CI/CD pipelines.
+#   - The `dbt_packages/` folder should be in .gitignore (it's auto-generated).
+#
+# HOW TO FIND PACKAGES:
+#   Browse the dbt Package Hub: https://hub.getdbt.com/
+#
+# LEARNING TIP:
+#   Start with dbt_utils — it's the "lodash" of dbt. Almost every project uses it.
+# ==============================================================================
+
 packages:
+
+  # ---------------------------------------------------------------------------
+  # dbt_utils — The essential utility library (by dbt Labs)
+  # ---------------------------------------------------------------------------
+  # Provides 50+ macros for common SQL patterns:
+  #   - generate_surrogate_key(): Create hash-based surrogate keys for dimensions
+  #   - star():                   Select all columns except specified ones
+  #   - pivot() / unpivot():      Reshape data (rows ↔ columns)
+  #   - date_spine():             Generate a continuous sequence of dates
+  #   - get_column_values():      Dynamically get distinct values from a column
+  #   - safe_add():               NULL-safe addition (NULL + 5 = 5, not NULL)
+  #
+  # Used in this project:
+  #   {{ dbt_utils.generate_surrogate_key(['region']) }}  → in dim_regions.sql
+  #   {{ dbt_utils.generate_surrogate_key(['store_id']) }} → in dim_stores.sql
   - package: dbt-labs/dbt_utils
     version: [">=1.1.0", "<2.0.0"]
+
+  # ---------------------------------------------------------------------------
+  # dbt_expectations — Great Expectations-style data quality tests
+  # ---------------------------------------------------------------------------
+  # Brings 50+ schema tests inspired by the Great Expectations Python library:
+  #   - expect_column_values_to_be_between:    Min/max range checks
+  #   - expect_column_values_to_not_be_null:   Enhanced null checks
+  #   - expect_column_value_lengths_to_equal:  String length validation
+  #   - expect_table_row_count_to_be_between:  Table-level row count checks
+  #   - expect_column_values_to_match_regex:   Pattern matching
+  #
+  # Used in this project (in _staging__models.yml):
+  #   - dbt_expectations.expect_column_values_to_be_between:
+  #       min_value: 1    # quantity must be >= 1
+  #   - dbt_expectations.expect_column_values_to_be_between:
+  #       min_value: 0.01 # unit_price must be > 0
   - package: calogica/dbt_expectations
     version: [">=0.10.0", "<1.0.0"]

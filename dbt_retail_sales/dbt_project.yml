@@ -1,38 +1,122 @@
+# ==============================================================================
+# dbt_project.yml — The main configuration file for every dbt project.
+# ==============================================================================
+#
+# WHAT IS THIS FILE?
+#   This is the "entry point" for dbt. When you run `dbt run`, dbt reads this
+#   file first to understand your project name, folder structure, and default
+#   configurations for models.
+#
+# KEY CONCEPTS:
+#   - Every dbt project MUST have a dbt_project.yml at its root.
+#   - It defines WHERE dbt looks for models, tests, macros, etc.
+#   - It sets DEFAULT materializations and schemas per folder.
+#   - Global variables (vars) are also declared here.
+#
+# LEARNING TIP:
+#   Think of this file like package.json in Node.js or setup.py in Python —
+#   it's the project manifest that configures everything.
+# ==============================================================================
+
+# Project name — must match the profile name in profiles.yml.
+# This is how dbt links this project to its connection credentials.
 name: 'retail_sales'
+
+# Semantic version of your dbt project (for your own tracking, not used by dbt).
 version: '1.0.0'
+
+# Config version — always use 2. This tells dbt to use the modern YAML syntax
+# (version 1 is deprecated and should never be used in new projects).
 config-version: 2
 
+# Profile — must match a key in profiles.yml.
+# This tells dbt which database connection to use when running models.
+# Example: `dbt run --target dev` uses the "dev" output under this profile.
 profile: 'retail_sales'
 
-model-paths: ["models"]
-analysis-paths: ["analyses"]
-test-paths: ["tests"]
-seed-paths: ["seeds"]
-macro-paths: ["macros"]
-snapshot-paths: ["snapshots"]
+# ==============================================================================
+# DIRECTORY PATHS — where dbt looks for each type of file.
+# ==============================================================================
+# You can rename these if your project structure differs, but the defaults
+# below are the standard dbt convention that most teams follow.
 
+model-paths: ["models"]           # SQL models (staging, intermediate, marts)
+analysis-paths: ["analyses"]      # Ad-hoc SQL queries (compiled but NOT materialized)
+test-paths: ["tests"]             # Custom singular data tests (SQL files)
+seed-paths: ["seeds"]             # Small CSV reference data files
+macro-paths: ["macros"]           # Reusable SQL/Jinja functions
+snapshot-paths: ["snapshots"]     # SCD Type 2 snapshot definitions
+
+# Folders to delete when running `dbt clean`.
+# "target" holds compiled SQL and run artifacts.
+# "dbt_packages" holds installed packages (like node_modules).
 clean-targets:
   - "target"
   - "dbt_packages"
 
+# ==============================================================================
+# VARIABLES (vars) — Global parameters accessible in any model via {{ var() }}
+# ==============================================================================
+#
+# HOW TO USE:
+#   In a model: {{ var('min_record_count') }}  → returns 100
+#   Override at runtime: dbt run --vars '{"min_record_count": 50}'
+#
+# LEARNING TIP:
+#   vars are like environment variables for your SQL. They let you parameterize
+#   thresholds, feature flags, and configurations without hardcoding values.
+
 vars:
-  # Data quality thresholds
-  min_record_count: 100
-  max_null_percentage: 5.0
-  # CDC
+  # Data quality thresholds — used in validation models
+  min_record_count: 100       # Minimum rows expected per batch
+  max_null_percentage: 5.0    # Max allowed NULL % in critical columns
+
+  # CDC (Change Data Capture) feature flag
+  # Set to false to skip CDC-specific logic (e.g., delete propagation)
   cdc_enabled: true
 
+# ==============================================================================
+# MODEL CONFIGURATIONS — Default settings applied per folder.
+# ==============================================================================
+#
+# HOW THIS WORKS:
+#   The hierarchy is: project_name → folder → subfolder
+#   Each level can override the parent's settings.
+#   The "+" prefix means "apply this config to all models in this folder."
+#
+# MATERIALIZATION TYPES (choose one per model/folder):
+#   - view:         CREATE VIEW (fast to build, slow to query large data)
+#   - table:        CREATE TABLE AS SELECT (slow to build, fast to query)
+#   - incremental:  MERGE or INSERT (only processes new data — best for large tables)
+#   - ephemeral:    No database object! Compiled as a CTE (inline subquery)
+#
+# LEARNING TIP — The staging → intermediate → marts pattern:
+#   This is THE dbt best practice for organizing models:
+#   1. staging:      Clean raw data (1:1 with sources), materialized as views
+#   2. intermediate: Business logic and joins, materialized as ephemeral CTEs
+#   3. marts:        Final output tables for BI tools, materialized as incremental
+#
+# WHY THIS PATTERN?
+#   - Staging as views: No extra storage cost, always shows fresh source data
+#   - Intermediate as ephemeral: No tables created, logic is inlined into
+#     downstream models (like a CTE), keeping the warehouse clean
+#   - Marts as incremental: Only processes new/changed rows, efficient for
+#     tables with millions of rows that grow daily
+
 models:
-  retail_sales:
+  retail_sales:                   # Must match the project name above
+
     staging:
-      +schema: staging
-      +materialized: view
-      +tags: ['staging', 'daily']
+      +schema: staging            # Models go into the STAGING schema
+      +materialized: view         # Views: cheap to create, always fresh data
+      +tags: ['staging', 'daily'] # Tags allow selective runs: `dbt run -s tag:daily`
+
     intermediate:
-      +schema: intermediate
-      +materialized: ephemeral
+      +schema: intermediate       # Models go into the INTERMEDIATE schema
+      +materialized: ephemeral    # Ephemeral: no table/view — inlined as CTEs
       +tags: ['intermediate', 'daily']
+
     marts:
-      +schema: analytics
-      +materialized: incremental
+      +schema: analytics          # Models go into the ANALYTICS schema
+      +materialized: incremental  # Incremental: only new/changed rows processed
       +tags: ['marts', 'daily']
