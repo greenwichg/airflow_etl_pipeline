@@ -596,6 +596,73 @@ class TestCDCLogic:
             assert script_path.exists(), f"Missing SQL script: {script_path}"
 
 
+class TestDbtProject:
+    """Validate dbt project structure and configuration"""
+
+    @pytest.fixture
+    def dbt_dir(self):
+        return Path(__file__).resolve().parent.parent / 'dbt_retail_sales'
+
+    def test_dbt_project_yml_exists(self, dbt_dir):
+        """dbt_project.yml must exist and be valid YAML"""
+        project_file = dbt_dir / 'dbt_project.yml'
+        assert project_file.exists(), f"Missing: {project_file}"
+
+    def test_dbt_model_layers_exist(self, dbt_dir):
+        """All three model layers should have SQL files"""
+        for layer in ['staging', 'intermediate', 'marts']:
+            layer_dir = dbt_dir / 'models' / layer
+            assert layer_dir.is_dir(), f"Missing model layer: {layer_dir}"
+            sql_files = list(layer_dir.glob('*.sql'))
+            assert len(sql_files) > 0, f"No SQL models in {layer}"
+
+    def test_dbt_staging_models(self, dbt_dir):
+        """Staging layer should have transactions and delete markers"""
+        staging_dir = dbt_dir / 'models' / 'staging'
+        expected = ['stg_sales_transactions.sql', 'stg_cdc_delete_markers.sql']
+        for model in expected:
+            assert (staging_dir / model).exists(), f"Missing staging model: {model}"
+
+    def test_dbt_mart_models(self, dbt_dir):
+        """Marts layer should have fact, dimension, and aggregate models"""
+        marts_dir = dbt_dir / 'models' / 'marts'
+        expected = ['fct_sales.sql', 'dim_regions.sql', 'dim_stores.sql', 'agg_daily_sales.sql']
+        for model in expected:
+            assert (marts_dir / model).exists(), f"Missing mart model: {model}"
+
+    def test_dbt_macros_exist(self, dbt_dir):
+        """Custom macros should exist"""
+        macros_dir = dbt_dir / 'macros'
+        assert len(list(macros_dir.glob('*.sql'))) >= 3
+
+    def test_dbt_custom_tests_exist(self, dbt_dir):
+        """Custom data tests should exist"""
+        tests_dir = dbt_dir / 'tests'
+        assert len(list(tests_dir.glob('*.sql'))) >= 2
+
+    def test_dbt_snapshot_exists(self, dbt_dir):
+        """SCD Type 2 snapshot should exist"""
+        snap_dir = dbt_dir / 'snapshots'
+        assert (snap_dir / 'snap_sales_fact.sql').exists()
+
+    def test_dbt_sources_defined(self, dbt_dir):
+        """Source YAML must define raw_cdc tables"""
+        sources_file = dbt_dir / 'models' / 'staging' / '_staging__sources.yml'
+        assert sources_file.exists()
+        content = sources_file.read_text()
+        assert 'cdc_sales_events' in content
+        assert 'sales_data_stage' in content
+
+    def test_dbt_interview_prep_exists(self):
+        """dbt interview preparation guide should exist"""
+        guide = Path(__file__).resolve().parent.parent / 'docs' / 'dbt_interview_prep.md'
+        assert guide.exists()
+        content = guide.read_text()
+        assert 'materialization' in content.lower()
+        assert 'incremental' in content.lower()
+        assert 'snapshot' in content.lower()
+
+
 # ============================================================================
 # INTEGRATION TESTS (Require Airflow Environment)
 # ============================================================================

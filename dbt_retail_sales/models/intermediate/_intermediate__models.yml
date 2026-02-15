@@ -1,0 +1,14 @@
+version: 2
+
+models:
+  - name: int_sales_enriched
+    description: >
+      Sales transactions enriched with derived business metrics:
+      net_amount, gross_profit, partition columns, and amount
+      sanity flags. This is an ephemeral model (compiled inline).
+
+  - name: int_sales_validated
+    description: >
+      Sales records that pass all data quality business rules.
+      Records failing validation are logged but excluded from
+      the downstream fact table.

@@ -1,0 +1,38 @@
+name: 'retail_sales'
+version: '1.0.0'
+config-version: 2
+
+profile: 'retail_sales'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Data quality thresholds
+  min_record_count: 100
+  max_null_percentage: 5.0
+  # CDC
+  cdc_enabled: true
+
+models:
+  retail_sales:
+    staging:
+      +schema: staging
+      +materialized: view
+      +tags: ['staging', 'daily']
+    intermediate:
+      +schema: intermediate
+      +materialized: ephemeral
+      +tags: ['intermediate', 'daily']
+    marts:
+      +schema: analytics
+      +materialized: incremental
+      +tags: ['marts', 'daily']
