@@ -76,11 +76,11 @@ graph LR
     SF_STG --> STREAM --> TASK -->|CDC MERGE| SF_FINAL
     VAL -->|Fail| ALERT[Alert & Skip]
 
-    style VAL fill:#ffeb3b
-    style ALERT fill:#f44336,color:#fff
-    style SF_FINAL fill:#4caf50,color:#fff
-    style CDCPath fill:#fff3e0
-    style BatchPath fill:#e3f2fd
+    style VAL fill:#fff9c4,stroke:#f9a825
+    style ALERT fill:#ef5350,color:#fff,stroke:#c62828
+    style SF_FINAL fill:#66bb6a,color:#fff,stroke:#2e7d32
+    style CDCPath fill:#fafafa,stroke:#e0e0e0
+    style BatchPath fill:#fafafa,stroke:#e0e0e0
 ```
 
 ### Batch Pipeline (Airflow)
@@ -160,8 +160,8 @@ graph LR
     SINK -->|Snowpipe Streaming| RAW
     T --- SR
 
-    style T fill:#ff9800,color:#fff
-    style RAW fill:#4caf50,color:#fff
+    style T fill:#ffe0b2,stroke:#e65100,color:#000
+    style RAW fill:#c8e6c9,stroke:#2e7d32,color:#000
 ```
 
 | Component | Technology | Purpose |
@@ -184,9 +184,9 @@ graph TD
     MERGE --> FINAL["ANALYTICS.SALES_FACT"]
     MERGE --> AUDIT["AUDIT.CDC_MERGE_LOG"]
 
-    style RAW fill:#fff3e0
-    style FINAL fill:#4caf50,color:#fff
-    style AUDIT fill:#e3f2fd
+    style RAW fill:#fafafa,stroke:#e0e0e0
+    style FINAL fill:#66bb6a,color:#fff,stroke:#2e7d32
+    style AUDIT fill:#fafafa,stroke:#90caf9
 ```
 
 Tasks run **autonomously** -- no Airflow scheduling needed. They activate only when streams detect new data (`SYSTEM$STREAM_HAS_DATA()`), avoiding wasted compute.
@@ -225,10 +225,10 @@ graph LR
     F --> D1 & D2 & A
     F --> SN
 
-    style S1 fill:#e3f2fd
-    style S2 fill:#ffcdd2
-    style F fill:#4caf50,color:#fff
-    style SN fill:#fff3e0
+    style S1 fill:#fafafa,stroke:#90caf9
+    style S2 fill:#fafafa,stroke:#ef9a9a
+    style F fill:#66bb6a,color:#fff,stroke:#2e7d32
+    style SN fill:#fafafa,stroke:#ffcc80
 ```
 
 ### dbt Model Layers
@@ -382,10 +382,10 @@ graph TD
     SUCCESS --> END(["end"])
     FAIL --> END
 
-    style TG fill:#e3f2fd
-    style VALIDATE fill:#ffeb3b
-    style SUCCESS fill:#4caf50,color:#fff
-    style FAIL fill:#f44336,color:#fff
+    style TG fill:#fafafa,stroke:#90caf9
+    style VALIDATE fill:#fff9c4,stroke:#f9a825
+    style SUCCESS fill:#66bb6a,color:#fff,stroke:#2e7d32
+    style FAIL fill:#ef5350,color:#fff,stroke:#c62828
 ```
 
 **Key settings:**
@@ -708,9 +708,9 @@ graph TD
 
     F --> ALERT["Alert + skip load"]
 
-    style E fill:#4caf50,color:#fff
-    style F fill:#f44336,color:#fff
-    style ALERT fill:#ff9800,color:#fff
+    style E fill:#66bb6a,color:#fff,stroke:#2e7d32
+    style F fill:#ef5350,color:#fff,stroke:#c62828
+    style ALERT fill:#ffa726,color:#fff,stroke:#e65100
 ```
 
 ---
@@ -773,8 +773,8 @@ graph LR
     end
     A1 -.->|"Add regions via JSON<br/>Swap Pandas for Spark"| B1
 
-    style Current fill:#e3f2fd
-    style Scaled fill:#c8e6c9
+    style Current fill:#fafafa,stroke:#90caf9
+    style Scaled fill:#fafafa,stroke:#a5d6a7
 ```
 
 | Component | Current | At 10x |
