@@ -16,6 +16,31 @@
 # LEARNING TIP:
 #   Think of this file like package.json in Node.js or setup.py in Python —
 #   it's the project manifest that configures everything.
+#
+# ==============================================================================
+# EXECUTION ORDER — What runs when?
+# ==============================================================================
+#
+# Manual (individual commands — run in this order):
+#   1. dbt deps      → Install packages (dbt_utils, dbt_expectations)
+#   2. dbt seed      → Load CSV files into warehouse tables
+#   3. dbt run       → Build models in DAG order (staging → intermediate → marts)
+#   4. dbt test      → Run schema + singular tests on built models
+#   5. dbt snapshot  → Capture SCD Type 2 history from fact tables
+#
+# Unified (one command, DAG-aware — recommended for production):
+#   dbt build        → Runs seed/run/test/snapshot interleaved per node
+#                      If a test fails, downstream models are NOT built (fail-fast)
+#
+# Parse phase (happens automatically before any command):
+#   1. Read dbt_project.yml → project configs
+#   2. Read profiles.yml    → database connection
+#   3. Load macros/         → compile Jinja functions (available to all models)
+#   4. Parse models/        → extract ref()/source(), build dependency DAG
+#   5. Compile Jinja → SQL  → expand macros into raw SQL
+#
+# NOTE: Macros are NOT a separate execution step. They are compiled (expanded)
+#       into raw SQL during the parse phase, before any model runs.
 # ==============================================================================
 
 # Project name — must match the profile name in profiles.yml.

@@ -37,6 +37,8 @@
         incremental_strategy='merge',
         -- Cluster by sale_date for fast date-range queries on dashboards
         cluster_by=['sale_date'],
+        -- on_schema_change: auto-add new columns if we add new KPIs
+        on_schema_change='append_new_columns',
         tags=['marts', 'aggregate', 'daily']
     )
 }}

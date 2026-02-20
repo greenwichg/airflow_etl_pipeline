@@ -17,6 +17,17 @@
 #   The tests here complement (not replace) the staging tests:
 #   - Staging tests: catch source data issues (null IDs, invalid values)
 #   - Mart tests: catch transformation issues (broken joins, lost rows)
+#
+# TEST SEVERITY:
+#   - severity: error (default) — pipeline FAILS if test fails
+#   - severity: warn — logs a warning but pipeline CONTINUES
+#   Use 'error' for critical tests (PKs, required fields) and 'warn' for
+#   non-critical checks (range validation, freshness).
+#
+# RELATIONSHIPS TEST (Foreign Key Check):
+#   Verifies that every value in a column exists in another model's column.
+#   Example: every store_id in fct_sales must exist in dim_stores.
+#   This is the dbt equivalent of a SQL FOREIGN KEY constraint.
 # ==============================================================================
 
 version: 2
@@ -35,31 +46,61 @@ models:
       sale_date and region for optimal BI query performance.
     columns:
       # Primary key: must be unique and not null in the fact table
+      # severity: error = pipeline FAILS if duplicates or nulls found
       - name: sale_id
         description: Primary key
         tests:
-          - unique           # If this fails, deduplication logic is broken
-          - not_null
-      # Foreign keys: ensure we can join to dimensions
+          - unique:
+              severity: error    # CRITICAL: duplicates break all downstream analytics
+          - not_null:
+              severity: error    # CRITICAL: null PKs cause join failures
+
+      # Foreign keys: validate referential integrity with dimensions
       - name: customer_id
         tests:
-          - not_null
+          - not_null:
+              severity: error
+
+      # RELATIONSHIPS TEST — Foreign key check against dim_stores.
+      # Verifies every store_id in fct_sales exists in the dimension.
+      # If a store_id is orphaned (missing from dim), JOINs will silently
+      # drop those sales rows → undercounting revenue on dashboards.
+      - name: store_id
+        tests:
+          - not_null:
+              severity: error
+          - relationships:                # FK integrity check
+              to: ref('dim_stores')       # The parent dimension table
+              field: store_id             # Column in the parent table
+              severity: warn              # Warn (not fail) because dim_stores
+                                          # is rebuilt from fct_sales, so timing
+                                          # issues can cause transient mismatches
+
       - name: sale_date
         tests:
-          - not_null
+          - not_null:
+              severity: error
+
       # Dimension: validate region values in the fact table too
       - name: region
         tests:
-          - not_null
+          - not_null:
+              severity: error
           - accepted_values:
               values: ['US-EAST', 'US-WEST', 'EUROPE', 'ASIA-PACIFIC']
+              severity: error    # Unknown region = extraction config problem
+
       # Derived measures: ensure enrichment logic didn't produce nulls
+      # severity: warn because a null here means a calculation bug,
+      # not a data integrity issue — the pipeline can continue
       - name: net_amount
         tests:
-          - not_null
+          - not_null:
+              severity: warn     # Warning: investigate calculation logic
       - name: gross_profit
         tests:
-          - not_null
+          - not_null:
+              severity: warn     # Warning: investigate calculation logic
 
   # ---------------------------------------------------------------------------
   # dim_regions — Region dimension table

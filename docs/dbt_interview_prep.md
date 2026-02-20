@@ -26,6 +26,11 @@ Comprehensive Q&A guide for dbt (data build tool) interviews, covering fundament
 18. [dbt Cloud & CI/CD](#18-dbt-cloud--cicd)
 19. [Variables & Custom Generic Tests](#19-variables--custom-generic-tests)
 20. [dbt Mesh & Multi-Project](#20-dbt-mesh--multi-project)
+21. [Execution Flow & DAG Order](#21-execution-flow--dag-order)
+22. [Graph Operators & Selectors](#22-graph-operators--selectors)
+23. [Advanced Testing](#23-advanced-testing)
+24. [Incremental Advanced Configs](#24-incremental-advanced-configs)
+25. [Grants, Analyses & Operations](#25-grants-analyses--operations)
 
 ---
 
@@ -1058,6 +1063,752 @@ Team A: dbt_sales           Team B: dbt_marketing
    ```sql
    select * from {{ ref('dbt_sales', 'fct_sales') }}
    ```
+
+---
+
+## 21. Execution Flow & DAG Order
+
+### Q: What is the execution order in dbt? Which components run first?
+
+**A:** Understanding what runs when is critical. dbt has **individual commands** that each handle one component, and a **unified `dbt build`** command that runs everything in the correct DAG order.
+
+#### Individual Commands (Manual Execution Order)
+
+When running commands individually, you must execute them in this order:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    dbt EXECUTION ORDER (Manual)                     │
+│                                                                     │
+│  Step 1: dbt deps          Install third-party packages             │
+│              │              (dbt_utils, dbt_expectations)           │
+│              ▼              Downloads into dbt_packages/            │
+│  Step 2: dbt seed           Load CSV reference data into warehouse  │
+│              │              (payment_methods.csv → table)           │
+│              ▼                                                      │
+│  Step 3: dbt run            Build all models in DAG order           │
+│              │              staging → intermediate → marts          │
+│              ▼                                                      │
+│  Step 4: dbt test           Run all schema + singular tests         │
+│              │              (unique, not_null, custom SQL tests)    │
+│              ▼                                                      │
+│  Step 5: dbt snapshot       Run SCD Type 2 snapshots                │
+│                             (track historical changes)              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why this order?**
+1. **deps first** — packages provide macros used by models (e.g., `generate_surrogate_key`). Without deps, models using package macros will fail to compile.
+2. **seed before run** — models might `ref('payment_methods')` (a seed table). If the seed table doesn't exist yet, the model fails.
+3. **run before test** — tests query the model tables. If the model hasn't been built yet, tests fail with "table not found."
+4. **snapshot after run** — snapshots read from models (`ref('fct_sales')`). The model must be up-to-date before the snapshot captures its state.
+
+#### `dbt build` — The All-in-One Command
+
+`dbt build` is the **recommended** command for production. It runs seeds, models, tests, and snapshots **interleaved in DAG order** — not sequentially:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     dbt build (DAG-Aware Order)                     │
+│                                                                     │
+│  Instead of: seed ALL → run ALL → test ALL → snapshot ALL           │
+│  It does:    seed/run/test each node in dependency order             │
+│                                                                     │
+│  Execution for this project:                                        │
+│                                                                     │
+│  1. dbt seed: payment_methods                                       │
+│       ▼                                                             │
+│  2. dbt run:  stg_sales_transactions (view)                         │
+│  3. dbt test: unique(sale_id), not_null(sale_id), ...               │
+│       ▼                                                             │
+│  4. dbt run:  stg_cdc_delete_markers (view)                         │
+│  5. dbt test: not_null(sale_id)                                     │
+│       ▼                                                             │
+│  6. dbt run:  int_sales_enriched (ephemeral — no actual execution)  │
+│  7. dbt run:  int_sales_validated (ephemeral — no actual execution) │
+│       ▼                                                             │
+│  8. dbt run:  fct_sales (incremental merge)                         │
+│  9. dbt test: unique(sale_id), not_null(region), ...                │
+│       ▼                                                             │
+│  10. dbt run:  dim_regions (table)                                  │
+│  11. dbt run:  dim_stores (table)                                   │
+│  12. dbt test: assert_no_orphan_stores (singular test)              │
+│       ▼                                                             │
+│  13. dbt run:  agg_daily_sales (incremental merge)                  │
+│  14. dbt test: assert_daily_sales_completeness (singular test)      │
+│       ▼                                                             │
+│  15. dbt snapshot: snap_sales_fact (SCD Type 2)                     │
+│                                                                     │
+│  KEY BENEFIT: If step 3 (stg tests) FAILS, dbt STOPS and does NOT  │
+│  build fct_sales. This prevents bad data from flowing downstream!   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why `dbt build` is better than running commands individually:**
+
+| Aspect | Individual commands | `dbt build` |
+|--------|-------------------|-------------|
+| **Test timing** | All tests run AFTER all models | Tests run per model immediately |
+| **Fail-fast** | Bad staging data still builds marts | Bad staging data stops the pipeline |
+| **Efficiency** | 4 separate commands | 1 command |
+| **DAG awareness** | You manage the order | dbt manages the order |
+
+### Q: How does dbt determine the order of model execution within `dbt run`?
+
+**A:** dbt builds a **DAG (Directed Acyclic Graph)** from the `ref()` and `source()` calls in your models:
+
+```
+source('raw_cdc', 'sales_data_stage')
+        │
+        ├──► stg_sales_transactions ──► int_sales_enriched
+        │                                      │
+        │                               int_sales_validated
+        │                                      │
+        ├──► stg_cdc_delete_markers      fct_sales
+        │                               /    │    \
+        │                    dim_regions  dim_stores  agg_daily_sales
+        │                                      │
+        │                          snap_sales_fact (snapshot)
+```
+
+**Rules:**
+1. **Parents before children** — `stg_sales_transactions` runs before `int_sales_enriched` because of `ref('stg_sales_transactions')`
+2. **Independent models in parallel** — `dim_regions` and `dim_stores` can run simultaneously (controlled by `threads` in profiles.yml)
+3. **Ephemeral models are skipped** — `int_sales_enriched` and `int_sales_validated` don't execute; their SQL is inlined as CTEs into `fct_sales`
+4. **Circular dependencies are forbidden** — if A refs B and B refs A, dbt errors at compile time
+
+### Q: What role do macros play in the execution flow?
+
+**A:** Macros are **NOT executed as a separate step**. They are:
+- **Compiled at parse time** — before any model runs, dbt reads all macros and makes them available as Jinja functions
+- **Expanded inline** — when a model calls `{{ cents_to_dollars('price') }}`, dbt replaces it with `(price / 100)::number(18, 2)` during compilation
+- **Think of macros as functions, not tasks** — they're called by models/tests/hooks, not run independently
+
+```
+Parse phase (before execution):
+  1. Read dbt_project.yml
+  2. Read profiles.yml
+  3. Load ALL macros (from macros/ and dbt_packages/)
+  4. Load ALL models, tests, seeds, snapshots
+  5. Compile Jinja → raw SQL (macros are expanded here)
+  6. Build the DAG from ref()/source() calls
+
+Execution phase:
+  7. Execute nodes in DAG order (seed → run → test → snapshot)
+```
+
+### Q: What happens during the `dbt compile` step?
+
+**A:** `dbt compile` runs ONLY the parse phase (steps 1-6 above) without executing anything in the warehouse. It's useful for:
+
+1. **Debugging Jinja** — see the compiled SQL that dbt will actually run:
+   ```bash
+   dbt compile -s fct_sales
+   # Output in: target/compiled/retail_sales/models/marts/fct_sales.sql
+   ```
+
+2. **Syntax checking** — catch Jinja errors before running
+3. **Reviewing incremental logic** — see the different SQL for first run vs incremental run
+
+### Q: What is the difference between `dbt run` and `dbt build`?
+
+**A:**
+
+```bash
+# dbt run — ONLY builds models (no tests, no seeds, no snapshots)
+dbt run
+# Equivalent to: CREATE VIEW / CREATE TABLE / MERGE for each model
+
+# dbt build — builds EVERYTHING in DAG order with fail-fast
+dbt build
+# Equivalent to: for each node in DAG order:
+#   if seed → dbt seed
+#   if model → dbt run
+#   if test → dbt test (STOP if fails)
+#   if snapshot → dbt snapshot
+```
+
+### Q: How does our Airflow DAG execute dbt?
+
+**A:** In our project, the Airflow DAG runs dbt as a `TaskGroup` with **individual commands in the correct manual order**:
+
+```python
+# From dags/retail_sales_etl_dag.py:
+dbt_deps >> dbt_seed >> dbt_run >> dbt_test >> dbt_snapshot
+```
+
+```
+Airflow DAG execution:
+  extract_data → transform_data → validate_quality → stage_to_snowflake
+       → merge_to_final → [dbt TaskGroup] → verify_load → success
+
+  dbt TaskGroup (sequential):
+    ┌──────────┐    ┌──────────┐    ┌─────────┐    ┌──────────┐    ┌──────────────┐
+    │ dbt deps │ →  │ dbt seed │ →  │ dbt run │ →  │ dbt test │ →  │ dbt snapshot │
+    └──────────┘    └──────────┘    └─────────┘    └──────────┘    └──────────────┘
+```
+
+**Why not use `dbt build` in Airflow?**
+We use individual commands instead of `dbt build` because:
+1. **Granular monitoring** — each step appears as a separate task in the Airflow UI
+2. **Targeted retries** — if `dbt test` fails, you can retry just that task
+3. **Clear visibility** — you see exactly which step failed and how long each took
+4. **`dbt build` is equally valid** — many teams use a single `dbt build` task for simplicity
+
+### Q: Can you summarize the complete lifecycle of a dbt project execution?
+
+**A:** Here's the full lifecycle from start to finish:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE dbt EXECUTION LIFECYCLE                      │
+│                                                                         │
+│  ┌─── PARSE PHASE (happens automatically before any command) ────────┐ │
+│  │                                                                    │ │
+│  │  1. Read dbt_project.yml      → project name, paths, configs      │ │
+│  │  2. Read profiles.yml         → database connection details       │ │
+│  │  3. Read packages.yml         → third-party dependencies          │ │
+│  │  4. Load macros/              → compile Jinja functions            │ │
+│  │  5. Load models/              → parse SQL, extract ref()/source() │ │
+│  │  6. Load tests/               → parse singular test SQL           │ │
+│  │  7. Load snapshots/           → parse snapshot configs            │ │
+│  │  8. Load seeds/               → read CSV headers                  │ │
+│  │  9. Build DAG                 → dependency graph from ref()       │ │
+│  │  10. Compile Jinja → SQL      → expand macros, resolve refs       │ │
+│  │                                                                    │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  ┌─── EXECUTION PHASE (what actually runs in the warehouse) ─────────┐ │
+│  │                                                                    │ │
+│  │  11. dbt deps       → pip-install packages into dbt_packages/     │ │
+│  │  12. dbt seed       → COPY CSV data into warehouse tables         │ │
+│  │  13. dbt run        → execute models in DAG order:                │ │
+│  │      • Views:         CREATE OR REPLACE VIEW AS ...               │ │
+│  │      • Tables:        CREATE OR REPLACE TABLE AS ...              │ │
+│  │      • Incremental:   MERGE INTO target USING source ON key ...   │ │
+│  │      • Ephemeral:     (skipped — inlined as CTE in downstream)    │ │
+│  │  14. dbt test       → run test queries, check for failures        │ │
+│  │      • Schema:        SELECT COUNT(*) FROM (...) WHERE fail       │ │
+│  │      • Singular:      SELECT ... (any rows = failure)             │ │
+│  │  15. dbt snapshot   → compare source vs snapshot, track changes   │ │
+│  │      • New rows:      INSERT with dbt_valid_from = now            │ │
+│  │      • Changed rows:  UPDATE old (dbt_valid_to = now)             │ │
+│  │                       INSERT new (dbt_valid_from = now)           │ │
+│  │      • Deleted rows:  UPDATE (dbt_valid_to = now) if configured   │ │
+│  │                                                                    │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  ┌─── ARTIFACT PHASE (after execution completes) ────────────────────┐ │
+│  │                                                                    │ │
+│  │  16. Write manifest.json      → full DAG + compiled SQL           │ │
+│  │  17. Write run_results.json   → status, timing, row counts        │ │
+│  │  18. Write catalog.json       → column types (if docs generate)   │ │
+│  │  19. Write sources.json       → freshness results (if checked)    │ │
+│  │                                                                    │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 22. Graph Operators & Selectors
+
+### Q: What are dbt graph operators and how do they work?
+
+**A:** Graph operators let you select models based on their position in the DAG (dependency graph). They're used with `-s` (select) and `--exclude` flags:
+
+| Operator | Syntax | Meaning | Example |
+|----------|--------|---------|---------|
+| **+** (upstream) | `+model` | Model AND all its ancestors | `dbt run -s +fct_sales` builds stg, int, AND fct_sales |
+| **+** (downstream) | `model+` | Model AND all its descendants | `dbt run -s stg_sales_transactions+` builds stg, int, fct, dim, agg |
+| **+** (both) | `+model+` | All ancestors AND descendants | `dbt run -s +fct_sales+` builds everything connected |
+| **@** (at) | `@model` | Model + ancestors + descendants of ancestors | `dbt test -s @fct_sales` tests fct_sales AND its parent's other children |
+| **n+** (depth) | `1+model` | Only 1 level of ancestors | `dbt run -s 1+fct_sales` builds only immediate parents |
+
+**Practical examples from our project:**
+```bash
+# Build fct_sales and everything it depends on (staging + intermediate)
+dbt run -s +fct_sales
+
+# Build staging model and everything downstream (intermediate + marts)
+dbt run -s stg_sales_transactions+
+
+# Build ONLY the direct parents of fct_sales (1 level up)
+dbt run -s 1+fct_sales
+
+# Run all models EXCEPT dimensions
+dbt run --exclude dim_regions dim_stores
+
+# Combine: build marts and test them
+dbt build -s tag:marts
+```
+
+### Q: What is the difference between `--select` and `--exclude`?
+
+**A:**
+```bash
+# --select (-s): ONLY run these models
+dbt run -s staging.*              # Run all models in the staging folder
+dbt run -s fct_sales dim_regions  # Run these two specific models
+
+# --exclude: Run everything EXCEPT these models
+dbt run --exclude dim_stores      # Run all models except dim_stores
+
+# Combine both: run marts but skip aggregations
+dbt run -s tag:marts --exclude agg_daily_sales
+```
+
+### Q: What are YAML selectors and when do you use them?
+
+**A:** YAML selectors are **named, reusable selection rules** saved in a `selectors.yml` file. They replace long command-line flags:
+
+```yaml
+# selectors.yml
+selectors:
+  - name: daily_run
+    description: "Models that run in the daily Airflow DAG"
+    definition:
+      union:
+        - method: tag
+          value: daily
+        - method: fqn        # Fully qualified name
+          value: snap_sales_fact
+
+  - name: staging_only
+    description: "Just staging models for quick validation"
+    definition:
+      method: path
+      value: models/staging
+
+  - name: modified_plus_downstream
+    description: "For CI: changed models and their dependents"
+    definition:
+      method: state:modified
+      value: "true"
+      children:
+        depth: 9999   # All downstream
+```
+
+**Usage:**
+```bash
+dbt run --selector daily_run       # Run all tag:daily + snapshot
+dbt test --selector staging_only   # Test only staging models
+dbt build --selector modified_plus_downstream  # Slim CI
+```
+
+**When to use YAML selectors:**
+- Complex selection logic that's hard to remember as CLI flags
+- CI/CD pipelines (version-control your selection rules)
+- Team conventions ("daily_run" is clearer than a long `-s` command)
+
+### Q: What are the different selection methods in dbt?
+
+**A:**
+
+| Method | Syntax | Example |
+|--------|--------|---------|
+| **fqn** (model name) | `dbt run -s fct_sales` | Run a specific model |
+| **tag** | `dbt run -s tag:daily` | Run models with a tag |
+| **path** | `dbt run -s models/staging` | Run all models in a folder |
+| **source** | `dbt run -s source:raw_cdc+` | Run all models downstream of a source |
+| **exposure** | `dbt run -s exposure:dashboard+` | Run models needed for an exposure |
+| **config** | `dbt run -s config.materialized:incremental` | Run all incremental models |
+| **test_type** | `dbt test -s test_type:singular` | Run only singular tests |
+| **state** | `dbt run -s state:modified+` | Run modified models (Slim CI) |
+| **package** | `dbt run -s dbt_utils` | Run models from a package |
+| **metric** | `dbt run -s metric:revenue` | Run models for a metric |
+
+---
+
+## 23. Advanced Testing
+
+### Q: What is the `relationships` test?
+
+**A:** The `relationships` test checks **foreign key integrity** — it verifies that every value in a column exists in another model's column:
+
+```yaml
+# Example: every store_id in fct_sales must exist in dim_stores
+models:
+  - name: fct_sales
+    columns:
+      - name: store_id
+        tests:
+          - relationships:
+              to: ref('dim_stores')   # The parent table
+              field: store_id          # The column in the parent table
+```
+
+**What dbt generates:**
+```sql
+SELECT count(*) FROM fct_sales
+WHERE store_id NOT IN (SELECT store_id FROM dim_stores)
+-- If count > 0 → test FAILS (orphan foreign keys found)
+```
+
+### Q: What is test severity and how do you configure it?
+
+**A:** Test severity controls what happens when a test fails:
+
+| Severity | Behavior | Use case |
+|----------|----------|----------|
+| **error** (default) | Pipeline fails, downstream models are NOT built | Critical tests: unique, not_null on primary keys |
+| **warn** | Warning logged but pipeline continues | Non-critical tests: range checks, freshness |
+
+```yaml
+columns:
+  - name: sale_id
+    tests:
+      - unique:
+          severity: error          # MUST pass — pipeline fails if duplicates found
+      - not_null:
+          severity: error          # MUST pass — null PKs break everything
+
+  - name: discount_amount
+    tests:
+      - dbt_expectations.expect_column_values_to_be_between:
+          min_value: 0
+          max_value: 1000
+          severity: warn           # Log warning but don't stop the pipeline
+          # Some discounts might legitimately exceed $1000 during promotions
+```
+
+### Q: What is `store_failures` and how does it work?
+
+**A:** `store_failures` saves the failing rows from a test into a database table for investigation:
+
+```yaml
+# In dbt_project.yml (global setting):
+tests:
+  +store_failures: true            # Save ALL test failures to tables
+  +schema: test_failures           # Store them in a dedicated schema
+
+# Or per-test in YAML:
+columns:
+  - name: sale_id
+    tests:
+      - unique:
+          config:
+            store_failures: true   # Only store failures for this specific test
+            severity: error
+```
+
+**What happens when enabled:**
+1. Test runs normally
+2. If rows fail, they're **inserted into a table** named `<schema>.test_failures_<test_name>`
+3. You can query that table to see exactly which rows failed and why
+4. Useful for: debugging data quality issues, auditing, root cause analysis
+
+```bash
+# Run tests with stored failures
+dbt test --store-failures
+
+# Then query in Snowflake:
+SELECT * FROM test_failures.unique_fct_sales_sale_id;
+-- Shows the exact duplicate sale_ids that caused the failure
+```
+
+### Q: What are unit tests in dbt (Core 1.8+)?
+
+**A:** Unit tests (introduced in dbt Core 1.8) let you test **model logic** with mock input data, without running against a real warehouse:
+
+```yaml
+# models/marts/_marts__models.yml
+unit_tests:
+  - name: test_net_amount_calculation
+    description: "Verify net_amount = total_amount - discount_amount"
+    model: fct_sales
+    given:
+      - input: ref('int_sales_validated')
+        rows:
+          - {sale_id: 1, total_amount: 100.00, discount_amount: 15.00,
+             tax_amount: 8.50, quantity: 2, unit_price: 50.00,
+             customer_id: 'C1', product_id: 'P1', store_id: 'S1',
+             sale_date: '2024-01-15', region: 'US-EAST',
+             payment_method: 'credit', is_amount_valid: true}
+    expect:
+      rows:
+        - {sale_id: 1, net_amount: 85.00, gross_profit: 76.50}
+
+  - name: test_invalid_quantity_filtered
+    description: "Verify rows with quantity <= 0 are excluded"
+    model: fct_sales
+    given:
+      - input: ref('int_sales_validated')
+        rows:
+          - {sale_id: 1, quantity: 0}   # Should be filtered out
+          - {sale_id: 2, quantity: 5}   # Should pass through
+    expect:
+      rows:
+        - {sale_id: 2}                  # Only valid row remains
+```
+
+**Unit tests vs data tests:**
+
+| | Data tests (dbt test) | Unit tests (dbt Core 1.8+) |
+|---|---|---|
+| **What they test** | Real data in the warehouse | Model SQL logic with mock data |
+| **When they run** | After models are built | Before/during build (no warehouse needed) |
+| **Speed** | Depends on data size | Very fast (mock data) |
+| **Use case** | "Is my data clean?" | "Is my SQL correct?" |
+
+```bash
+dbt test --select test_type:unit   # Run only unit tests
+```
+
+---
+
+## 24. Incremental Advanced Configs
+
+### Q: What is `on_schema_change` and why is it important?
+
+**A:** `on_schema_change` tells dbt what to do when the SELECT columns in an incremental model change (e.g., you add a new column):
+
+```sql
+{{
+    config(
+        materialized='incremental',
+        unique_key='sale_id',
+        on_schema_change='append_new_columns'   -- Handle schema evolution
+    )
+}}
+```
+
+| Option | Behavior | When to use |
+|--------|----------|-------------|
+| **ignore** (default) | Do nothing — new columns are silently dropped | When schema changes need manual review |
+| **fail** | Error immediately if schema differs | Production safety — catch unintended changes |
+| **append_new_columns** | Add new columns to target, fill with NULL | When you frequently add columns |
+| **sync_all_columns** | Add new columns AND drop removed columns | Full schema sync (most aggressive) |
+
+**Example scenario:**
+1. You add `loyalty_points` column to `fct_sales` SELECT
+2. Without `on_schema_change`: the new column is silently ignored
+3. With `append_new_columns`: dbt runs `ALTER TABLE fct_sales ADD COLUMN loyalty_points`
+4. With `fail`: dbt stops and says "schema changed, run --full-refresh"
+
+### Q: What is `full_refresh` config and `--full-refresh` flag?
+
+**A:**
+```sql
+-- Model-level config to PREVENT full refresh (protect large tables):
+{{
+    config(
+        materialized='incremental',
+        full_refresh=false   -- Even with --full-refresh flag, this model won't be dropped
+    )
+}}
+```
+
+```bash
+# Command-line flag to force full rebuild of ALL incremental models:
+dbt run --full-refresh
+
+# Selective full refresh (only fct_sales):
+dbt run -s fct_sales --full-refresh
+```
+
+**When to use `--full-refresh`:**
+- After adding/removing columns (schema change)
+- After fixing a bug in the incremental logic
+- When you suspect data drift between source and target
+- After changing the `unique_key` or `incremental_strategy`
+
+### Q: What are the different incremental strategies in detail?
+
+**A:**
+
+| Strategy | SQL Generated | Handles Updates? | Handles Deletes? | Best For |
+|----------|--------------|-----------------|-----------------|----------|
+| **append** | `INSERT INTO target SELECT ... FROM source` | No | No | Event logs, clickstreams |
+| **merge** | `MERGE INTO target USING source ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` | Yes | No (needs post-hook) | Fact tables with updates (our project) |
+| **delete+insert** | `DELETE FROM target WHERE key IN (source); INSERT INTO target SELECT ... FROM source` | Yes | Yes (within batch) | Alternative to merge (sometimes faster on Snowflake) |
+| **insert_overwrite** | `INSERT OVERWRITE INTO target PARTITION (date) SELECT ...` | Yes (full partition) | Yes (full partition) | BigQuery/Spark, partitioned tables |
+| **microbatch** (dbt 1.9+) | Processes data in time-based batches | Yes | No | Very large incremental loads |
+
+**Our project uses merge strategy:**
+```sql
+-- fct_sales.sql compiled output (simplified):
+MERGE INTO analytics.fct_sales AS target
+USING (SELECT ... FROM staging WHERE etl_loaded_at > watermark) AS source
+ON target.sale_id = source.sale_id
+WHEN MATCHED THEN UPDATE SET ...    -- Update existing rows
+WHEN NOT MATCHED THEN INSERT ...    -- Insert new rows
+-- CDC deletes handled separately via post_hook
+```
+
+---
+
+## 25. Grants, Analyses & Operations
+
+### Q: What are dbt grants?
+
+**A:** Grants let you manage **database permissions** (GRANT/REVOKE) directly from dbt config:
+
+```yaml
+# dbt_project.yml
+models:
+  retail_sales:
+    marts:
+      +grants:
+        select: ['analytics_role', 'bi_role']      # GRANT SELECT to these roles
+        insert: ['etl_role']                         # GRANT INSERT to ETL role
+```
+
+```sql
+-- Or in a model's config block:
+{{
+    config(
+        materialized='table',
+        grants={'select': ['analytics_role', 'bi_role']}
+    )
+}}
+```
+
+**What dbt runs after building the model:**
+```sql
+GRANT SELECT ON analytics.fct_sales TO ROLE analytics_role;
+GRANT SELECT ON analytics.fct_sales TO ROLE bi_role;
+```
+
+**Why use dbt grants instead of manual SQL?**
+- **Version controlled** — permissions are tracked in Git
+- **Consistent** — same grants applied every time the model is rebuilt
+- **Auditable** — PR review for permission changes
+
+### Q: What are dbt analyses?
+
+**A:** Analyses are **ad-hoc SQL queries** that are compiled by dbt (Jinja expanded) but NOT materialized in the database. They're useful for:
+- One-off investigations using `ref()` and `source()`
+- Queries shared across the team (version controlled)
+- SQL that benefits from Jinja templating but shouldn't create tables
+
+```sql
+-- analyses/monthly_revenue_report.sql
+-- This file is compiled but NOT executed by `dbt run`.
+-- Run it manually in your SQL client, or use `dbt compile` to expand Jinja.
+
+select
+    date_trunc('month', sale_date)   as month,
+    region,
+    sum(net_amount)                  as monthly_revenue,
+    count(*)                         as order_count,
+    avg(net_amount)                  as avg_order_value
+from {{ ref('fct_sales') }}
+where sale_date >= dateadd(month, -12, current_date())
+group by 1, 2
+order by 1 desc, 2
+```
+
+```bash
+# Compile (but don't run) all analyses — Jinja → raw SQL:
+dbt compile
+
+# Find the compiled output:
+cat target/compiled/retail_sales/analyses/monthly_revenue_report.sql
+# → The ref() is replaced with the actual table name
+```
+
+### Q: What is `dbt run-operation`?
+
+**A:** `run-operation` lets you **execute a macro directly** from the command line, without it being called by a model:
+
+```bash
+# Run a macro as a standalone operation:
+dbt run-operation cents_to_dollars --args '{"column_name": "price"}'
+
+# More practical example — a macro that grants permissions:
+dbt run-operation grant_select --args '{"role": "analytics_role"}'
+```
+
+```sql
+-- macros/grant_select.sql
+{% macro grant_select(role) %}
+    {% set models = ['fct_sales', 'dim_regions', 'dim_stores', 'agg_daily_sales'] %}
+    {% for model in models %}
+        GRANT SELECT ON {{ ref(model) }} TO ROLE {{ role }};
+    {% endfor %}
+{% endmacro %}
+```
+
+**Common use cases:**
+- Running maintenance macros (vacuum, grants, cleanup)
+- Database migrations
+- One-off data fixes
+- Testing macros during development
+
+### Q: What is `dbt retry`?
+
+**A:** `dbt retry` re-runs only the **failed nodes** from the previous run, without rebuilding everything that succeeded:
+
+```bash
+# First run — some models fail
+dbt run
+# Result: 8 passed, 2 failed (int_sales_enriched, fct_sales)
+
+# Fix the bug, then retry ONLY the failed models:
+dbt retry
+# Result: re-runs int_sales_enriched and fct_sales only
+```
+
+**How it works:**
+1. dbt saves the run results in `target/run_results.json`
+2. `dbt retry` reads that file to find which nodes failed
+3. Only those nodes (and their downstream dependents) are re-executed
+
+**When to use:**
+- After fixing a bug that caused partial pipeline failure
+- In CI/CD to retry flaky tests
+- In production to recover from transient errors (e.g., warehouse timeout)
+
+### Q: What is `dbt show`?
+
+**A:** `dbt show` compiles and runs a model's SQL, returning a **preview of the results** directly in the terminal (without materializing anything):
+
+```bash
+# Preview the first 5 rows of a model:
+dbt show -s fct_sales --limit 5
+
+# Preview an inline query using Jinja:
+dbt show --inline "select count(*) from {{ ref('fct_sales') }}"
+```
+
+**When to use:**
+- Quick data validation during development
+- Checking if a model compiles and returns reasonable results
+- Debugging without creating tables
+
+### Q: What are custom materializations?
+
+**A:** You can create your own materialization types beyond view/table/incremental/ephemeral:
+
+```sql
+-- macros/materializations/materialized_view.sql
+{% materialization materialized_view, adapter='snowflake' %}
+
+    {%- set target_relation = this -%}
+
+    {% call statement('main') %}
+        CREATE OR REPLACE MATERIALIZED VIEW {{ target_relation }}
+        AS {{ sql }}
+    {% endcall %}
+
+    {{ return({'relations': [target_relation]}) }}
+
+{% endmaterialization %}
+```
+
+**Usage:**
+```sql
+{{ config(materialized='materialized_view') }}
+select * from {{ ref('fct_sales') }}
+```
+
+**When to use custom materializations:**
+- Database-specific features (materialized views, external tables)
+- Complex DDL patterns not covered by built-in types
+- Organizational standards (custom logging, auditing per model)
+
+**Note:** Most teams never need custom materializations. The 4 built-in types cover 99% of use cases.
 
 ---
 
