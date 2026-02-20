@@ -72,6 +72,13 @@
         -- extremely fast by letting Snowflake skip irrelevant partitions.
         cluster_by=['sale_date', 'region'],
 
+        -- on_schema_change: what to do when the SELECT columns change.
+        -- Options: 'ignore' (default), 'fail', 'append_new_columns', 'sync_all_columns'
+        -- 'append_new_columns' = if you add a new column to the SELECT, dbt will
+        -- ALTER TABLE ADD COLUMN automatically. Existing rows get NULL for the new column.
+        -- This prevents the need for --full-refresh when evolving the schema.
+        on_schema_change='append_new_columns',
+
         -- Tags for selective execution
         tags=['marts', 'daily', 'fact']
     )
